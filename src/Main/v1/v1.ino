@@ -87,7 +87,8 @@ void handleCommand(const String& command) {
     if (key == "ssid")
       valid = value.length() >= 1 && value.length() <= 32;
     else if (key == "password")
-      valid = value.length() >= 8 && value.length() <= 63;
+      valid = value.isEmpty() ||
+          (value.length() >= 8 && value.length() <= 63);
     else if (key == "server") {
       IPAddress serverIP;
       valid = serverIP.fromString(value);
@@ -117,7 +118,7 @@ void handleCommand(const String& command) {
 
   if (command == "show") showConfig();
   else if (command == "connect") connectWiFi();
-  else if (command == "test") testServer();
+  else if (command == "test") sampleAndSend();
   else if (command == "help") {
     Serial.println("ssid=YOUR_WIFI_NAME");
     Serial.println("password=YOUR_WIFI_PASSWORD");
@@ -180,7 +181,7 @@ void sampleAndSend() {
   // Automatic source identification; no manual device ID configuration.
   String payload = "{\"device_id\":\"";
   payload += WiFi.macAddress();
-  payload += "\",\"test\":false,\"temperature_c\":";
+  payload += "\",\"temperature_c\":";
   payload += String(tempC, 2);
   payload += ",\"humidity_rh\":";
   payload += String(rh, 2);
@@ -270,7 +271,7 @@ void loop() {
       Serial.println("Connection timed out. Check settings, then type connect.");
     }
   }
-  
+
   // Take one sample approximately every 10 seconds.
   // Network timeouts may delay the next sample.
   if (millis() - lastSampleAt >= SAMPLE_INTERVAL_MS) {
