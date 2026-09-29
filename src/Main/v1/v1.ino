@@ -141,6 +141,19 @@ bool initSensor() {
   return true;
 }
 
+float readBatteryVoltage() {
+  // The onboard divider reduces battery voltage by half.
+  const int sampleCount = 16;
+  uint32_t totalMilliVolts = 0;
+
+  for (int i = 0; i < sampleCount; i++) {
+    totalMilliVolts += analogReadMilliVolts(A13);
+    delay(2);
+  }
+
+  return (totalMilliVolts / float(sampleCount)) * 2.0f / 1000.0f;
+}
+
 void sampleAndSend() {
   // Retry initialization if the sensor was previously unavailable.
   if (!sensorReady) {
@@ -158,6 +171,11 @@ void sampleAndSend() {
 
   float tempC = temperature.temperature;
   float rh = humidity.relative_humidity;
+  float batteryV = readBatteryVoltage();
+
+  Serial.print("Battery voltage: ");
+  Serial.print(batteryV, 3);
+  Serial.println(" V");
 
   if (!isfinite(tempC) || !isfinite(rh)) {
     Serial.println("Invalid sensor values. Sample skipped.");
@@ -185,6 +203,8 @@ void sampleAndSend() {
   payload += String(tempC, 2);
   payload += ",\"humidity_rh\":";
   payload += String(rh, 2);
+  payload += ",\"battery_v\":";
+  payload += String(batteryV, 3);
   payload += "}";
 
   WiFiClient client;
