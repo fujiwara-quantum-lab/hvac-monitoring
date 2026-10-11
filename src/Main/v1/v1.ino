@@ -1,16 +1,38 @@
+/* HVAC monitor: deep-sleep test version, based on the supplied v1.ino.
+ * Board: Adafruit Feather ESP32 V2; sensor: SHT45 on STEMMA QT.
+ * USB serial: 115200 baud, New Line.
+ * After power-on/reset: send config within 15 seconds to stay awake.
+ * Missing SSID/server: stays awake automatically. Send run when configured.
+ * Timer wake: connect (30-second timeout), sample/upload once, sleep 60 sec.
+ * Config mode: no automatic samples; test sends one real measurement.
+ * Existing hvac-config preferences and JSON fields are preserved.
+ * Sleep duration is NOT the exact reporting interval. Failed samples are lost.
+ * No automatic USB-power detection. Connect USB, press RESET, then config.
+ * This firmware has not been compiled with the ESP32 toolchain here.
+ */
 #include <WiFi.h>
+#include <Wire.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <Adafruit_SHT4x.h>
 #include <math.h>
+#include <esp_sleep.h>
+#include <driver/rtc_io.h>
 
 // One SHT45 per board
 Adafruit_SHT4x sht4;
 bool sensorReady = false;
 
-// Use millis() scheduling so USB commands remain available between samples.
-const unsigned long SAMPLE_INTERVAL_MS = 10000;
-unsigned long lastSampleAt = 0;
+const uint32_t SLEEP_SECONDS = 60;
+const unsigned long CONFIG_WINDOW_MS = 15000;
+bool configMode = false;
+bool bootWindow = false;
+unsigned long windowStarted = 0;
+
+// Explicit declarations also make function order unambiguous.
+void sampleAndSend();
+void connectWiFi();
+void enterDeepSleep();
 
 Preferences prefs;
 String ssid, password, serverUrl;
@@ -21,8 +43,10 @@ unsigned long connectStarted = 0;
 
 void showConfig() {
   Serial.println("--- Saved configuration ---");
+  Serial.println(configMode ? "Mode: CONFIG (awake)" : "Mode: MONITOR");
+  Serial.printf("Sleep duration: %lu seconds\n", (unsigned long)SLEEP_SECONDS);
   Serial.println("SSID: " + ssid);
-  Serial.println(password.length() ? "Password: [set]" : "Password: [not set]");
+  Serial.println(password.length() ? "Password: [set]" : "Password: [empty / open network]");
   Serial.println("Server: " + serverUrl);
   Serial.println(WiFi.status() == WL_CONNECTED
                      ? "Wi-Fi: connected"
@@ -40,39 +64,6 @@ void connectWiFi() {
   connectStarted = millis();
   connecting = true;
   Serial.println("Connecting... USB commands remain available.");
-}
-
-void testServer() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Connect Wi-Fi first.");
-    return;
-  }
-  if (serverUrl.isEmpty()) {
-    Serial.println("Set server URL first.");
-    return;
-  }
-
-  WiFiClient client;
-  HTTPClient http;
-  http.setConnectTimeout(5000);
-  http.setTimeout(5000);
-
-  if (!http.begin(client, serverUrl)) {
-    Serial.println("Invalid server URL.");
-    return;
-  }
-
-  http.addHeader("Content-Type", "application/json");
-  int status = http.POST(
-      "{\"test\":true,\"message\":\"USB configuration test\"}");
-
-  if (status > 0) {
-    Serial.printf("HTTP status: %d\n", status);
-    Serial.println("Server response: " + http.getString());
-  } else {
-    Serial.println("Send failed: " + HTTPClient::errorToString(status));
-  }
-  http.end();
 }
 
 void handleCommand(const String& command) {
@@ -94,16 +85,19 @@ void handleCommand(const String& command) {
       valid = serverIP.fromString(value);
 
       if (valid) {
-    // User enters only IPv4; store the complete HTTP endpoint.
-      value = String("http://") + serverIP.toString() + ":8000/data";
-  }
-}
+        // User enters only IPv4; store the complete HTTP endpoint.
+        value = String("http://") + serverIP.toString() + ":8000/data";
+      }
+    }
     if (!valid) {
       Serial.println("Invalid setting. Use ssid, password, or server.");
       return;
     }
 
-    if (prefs.putString(key.c_str(), value) == 0) {
+    // Empty strings return zero bytes even when saved; verify by readback.
+    prefs.putString(key.c_str(), value);
+    if (!prefs.isKey(key.c_str()) ||
+        prefs.getString(key.c_str(), "") != value) {
       Serial.println("Save failed.");
       return;
     }
@@ -116,14 +110,28 @@ void handleCommand(const String& command) {
     return;
   }
 
-  if (command == "show") showConfig();
+  if (command == "config") {
+    configMode = true;
+    bootWindow = false;
+    Serial.println("CONFIG mode: staying awake. Type run to resume monitoring.");
+  }
+  else if (command == "run") {
+    if (ssid.isEmpty() || serverUrl.isEmpty()) {
+      Serial.println("Set SSID and server IPv4 before run.");
+      return;
+    }
+    configMode = false;
+    bootWindow = false;
+    connectWiFi();
+  }
+  else if (command == "show") showConfig();
   else if (command == "connect") connectWiFi();
   else if (command == "test") sampleAndSend();
   else if (command == "help") {
     Serial.println("ssid=YOUR_WIFI_NAME");
     Serial.println("password=YOUR_WIFI_PASSWORD");
     Serial.println("server=COMPUTER_IP");
-    Serial.println("show | connect | test | help");
+    Serial.println("show | connect | test | config | run | help");
   } else {
     Serial.println("Unknown command. Type help.");
   }
@@ -232,19 +240,53 @@ void sampleAndSend() {
   http.end();
 }
 
-void setup() {
-  Serial.begin(115200);
-  delay(1500);
+void enterDeepSleep() {
+  esp_err_t result = esp_sleep_enable_timer_wakeup(
+      uint64_t(SLEEP_SECONDS) * 1000000ULL);
+  if (result != ESP_OK) {
+    configMode = true;
+    Serial.println("Sleep timer setup failed. Staying awake for configuration.");
+    return;
+  }
 
-  // Enable STEMMA QT power on Feather ESP32 V2.
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  Wire.end();
+  sensorReady = false;
+
+  // GPIO2 controls QT/NeoPixel power. RTC hold keeps it LOW during sleep.
+  const gpio_num_t powerPin = (gpio_num_t)NEOPIXEL_I2C_POWER;
+  rtc_gpio_init(powerPin);
+  rtc_gpio_set_direction(powerPin, RTC_GPIO_MODE_OUTPUT_ONLY);
+  rtc_gpio_set_level(powerPin, 0);
+  rtc_gpio_hold_en(powerPin);
+
+  prefs.end();
+  Serial.printf("Sleeping for %lu seconds.\n", (unsigned long)SLEEP_SECONDS);
+  Serial.flush();
+  esp_deep_sleep_start();
+}
+
+void setup() {
+  // Release the RTC hold before restoring normal GPIO control after wake.
+  const gpio_num_t powerPin = (gpio_num_t)NEOPIXEL_I2C_POWER;
+  rtc_gpio_hold_dis(powerPin);
+  rtc_gpio_deinit(powerPin);
+
+  bool timerWake = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER;
+  Serial.begin(115200);
+  delay(timerWake ? 100 : 1500);
+  Serial.println(timerWake ? "\nWake: TIMER" : "\nWake: POWER/RESET/OTHER");
+
   pinMode(NEOPIXEL_I2C_POWER, OUTPUT);
   digitalWrite(NEOPIXEL_I2C_POWER, HIGH);
   delay(10);
-
-sensorReady = initSensor();
+  sensorReady = initSensor();
 
   if (!prefs.begin("hvac-config", false)) {
-    Serial.println("Cannot open configuration storage.");
+    Serial.println("Cannot open configuration storage. Reset after inspection.");
+    // Avoid leaving a battery-powered device indefinitely awake on this fault.
+    enterDeepSleep();
     while (true) delay(1000);
   }
 
@@ -255,8 +297,16 @@ sensorReady = initSensor();
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
 
-  Serial.println("\nUSB configuration ready. Type help.");
+  configMode = ssid.isEmpty() || serverUrl.isEmpty();
+  bootWindow = !timerWake && !configMode;
+  windowStarted = millis();
   showConfig();
+
+  if (configMode) {
+    Serial.println("Missing configuration. Staying awake; type help, then run.");
+  } else if (bootWindow) {
+    Serial.println("Send config within 15 seconds to stay awake, or run now.");
+  }
 
   if (!ssid.isEmpty()) connectWiFi();
 }
@@ -292,11 +342,16 @@ void loop() {
     }
   }
 
-  // Take one sample approximately every 10 seconds.
-  // Network timeouts may delay the next sample.
-  if (millis() - lastSampleAt >= SAMPLE_INTERVAL_MS) {
-    lastSampleAt = millis();
+  if (bootWindow && millis() - windowStarted >= CONFIG_WINDOW_MS) {
+    bootWindow = false;
+    Serial.println("Configuration window ended. MONITOR mode.");
+  }
+
+  // Once connection succeeds or times out, attempt one sample, then sleep.
+  // All sample/upload failure paths return here, so they also lead to sleep.
+  if (!configMode && !bootWindow && !connecting) {
     sampleAndSend();
+    enterDeepSleep();
   }
 
   delay(5);
