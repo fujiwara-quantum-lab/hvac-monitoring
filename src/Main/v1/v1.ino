@@ -3,8 +3,9 @@
  * USB serial: 115200 baud, New Line.
  * After power-on/reset: send config within 15 seconds to stay awake.
  * Missing SSID/server: stays awake automatically. Send run when configured.
- * Timer wake: connect (30-second timeout), sample/upload once, sleep 60 sec.
+ * Timer wake: connect (30-second timeout), sample/upload once, sleep for the configured duration.
  * Config mode: no automatic samples; test sends one real measurement.
+ * sleep=SECONDS changes and saves the sleep duration (not wake-to-wake time).
  * Existing hvac-config preferences and JSON fields are preserved.
  * Sleep duration is NOT the exact reporting interval. Failed samples are lost.
  * No automatic USB-power detection. Connect USB, press RESET, then config.
@@ -23,7 +24,9 @@
 Adafruit_SHT4x sht4;
 bool sensorReady = false;
 
-const uint32_t SLEEP_SECONDS = 60;
+// Mutable setting, persisted in NVS Flash; restored after reset/deep sleep.
+uint32_t sleepSeconds = 60;
+const uint32_t MAX_SLEEP_SECONDS = 604800; // One week; reject accidental huge values.
 const unsigned long CONFIG_WINDOW_MS = 15000;
 bool configMode = false;
 bool bootWindow = false;
@@ -44,7 +47,7 @@ unsigned long connectStarted = 0;
 void showConfig() {
   Serial.println("--- Saved configuration ---");
   Serial.println(configMode ? "Mode: CONFIG (awake)" : "Mode: MONITOR");
-  Serial.printf("Sleep duration: %lu seconds\n", (unsigned long)SLEEP_SECONDS);
+  Serial.printf("Sleep duration: %lu seconds\n", (unsigned long)sleepSeconds);
   Serial.println("SSID: " + ssid);
   Serial.println(password.length() ? "Password: [set]" : "Password: [empty / open network]");
   Serial.println("Server: " + serverUrl);
@@ -74,6 +77,26 @@ void handleCommand(const String& command) {
     String value = command.substring(separator + 1);
     // Preserve spaces and '=' characters inside values.
 
+    if (key == "sleep") {
+      // Parse digits explicitly: String.toInt() would accept malformed suffixes.
+      bool digitsOnly = value.length() >= 1 && value.length() <= 6;
+      for (unsigned int i = 0; i < value.length(); i++)
+        if (value[i] < '0' || value[i] > '9') digitsOnly = false;
+      uint32_t seconds = digitsOnly ? value.toInt() : 0;
+      if (seconds < 1 || seconds > MAX_SLEEP_SECONDS) {
+        Serial.println("Use sleep=SECONDS (1 to 604800).");
+        return;
+      }
+      prefs.putUInt("sleep", seconds);
+      if (!prefs.isKey("sleep") || prefs.getUInt("sleep", 0) != seconds) {
+        Serial.println("Save failed.");
+        return;
+      }
+      sleepSeconds = seconds;
+      Serial.printf("Saved sleep duration: %lu seconds\n", (unsigned long)sleepSeconds);
+      return;
+    }
+
     bool valid = false;
     if (key == "ssid")
       valid = value.length() >= 1 && value.length() <= 32;
@@ -90,7 +113,7 @@ void handleCommand(const String& command) {
       }
     }
     if (!valid) {
-      Serial.println("Invalid setting. Use ssid, password, or server.");
+      Serial.println("Invalid setting. Use ssid, password, server, or sleep.");
       return;
     }
 
@@ -131,6 +154,7 @@ void handleCommand(const String& command) {
     Serial.println("ssid=YOUR_WIFI_NAME");
     Serial.println("password=YOUR_WIFI_PASSWORD");
     Serial.println("server=COMPUTER_IP");
+    Serial.println("sleep=SECONDS (1 to 604800; saved after power off)");
     Serial.println("show | connect | test | config | run | help");
   } else {
     Serial.println("Unknown command. Type help.");
@@ -242,7 +266,7 @@ void sampleAndSend() {
 
 void enterDeepSleep() {
   esp_err_t result = esp_sleep_enable_timer_wakeup(
-      uint64_t(SLEEP_SECONDS) * 1000000ULL);
+      uint64_t(sleepSeconds) * 1000000ULL);
   if (result != ESP_OK) {
     configMode = true;
     Serial.println("Sleep timer setup failed. Staying awake for configuration.");
@@ -262,7 +286,7 @@ void enterDeepSleep() {
   rtc_gpio_hold_en(powerPin);
 
   prefs.end();
-  Serial.printf("Sleeping for %lu seconds.\n", (unsigned long)SLEEP_SECONDS);
+  Serial.printf("Sleeping for %lu seconds.\n", (unsigned long)sleepSeconds);
   Serial.flush();
   esp_deep_sleep_start();
 }
@@ -293,6 +317,8 @@ void setup() {
   ssid = prefs.getString("ssid", "");
   password = prefs.getString("password", "");
   serverUrl = prefs.getString("server", "");
+  sleepSeconds = prefs.getUInt("sleep", 60);
+  if (sleepSeconds < 1 || sleepSeconds > MAX_SLEEP_SECONDS) sleepSeconds = 60;
 
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
