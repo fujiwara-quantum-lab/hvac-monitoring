@@ -10,6 +10,11 @@ readings taken without a battery; it is not an estimate of charge percentage.
 import argparse
 import json
 import math
+import os
+import threading
+import urllib.request
+import urllib.error
+from urllib.parse import urlsplit
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
@@ -20,6 +25,10 @@ from pathlib import Path
 # Inclusive comfort bounds. Physical validity is checked separately below.
 TEMP_MIN, TEMP_MAX = 20.0, 26.0
 RH_MIN, RH_MAX = 40.0, 60.0
+
+# Credentials stay in the process environment, never in the database or source.
+SLACK_ENABLED = False
+SLACK_TIMEOUT = 8
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "hvac.db"
 
@@ -50,6 +59,12 @@ def init_database():
                 received_at_utc TEXT NOT NULL, device_id TEXT NOT NULL,
                 metric TEXT NOT NULL, status TEXT NOT NULL, value REAL NOT NULL,
                 FOREIGN KEY(reading_id) REFERENCES readings(id))""")
+            # Durable delivery queue. A crash/restart keeps unsent messages.
+            # Existing alerts are deliberately not backfilled into this queue.
+            conn.execute("""CREATE TABLE IF NOT EXISTS slack_outbox (
+                id INTEGER PRIMARY KEY, message TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL DEFAULT 0,
+                sent_at_utc TEXT, last_error TEXT)""")
             # Last condition is durable, so restarting the server does not spam alerts.
             conn.execute("""CREATE TABLE IF NOT EXISTS alert_state (
                 device_id TEXT NOT NULL, metric TEXT NOT NULL, status TEXT NOT NULL,
@@ -117,10 +132,96 @@ def save_reading(data, source_ip):
                              (data["device_id"], metric, status))
             name = conn.execute("SELECT name FROM sensors WHERE device_id=?",
                                 (data["device_id"],)).fetchone()[0]
+            if events and SLACK_ENABLED:
+                # Queue in the SAME transaction as the reading and state change.
+                # Both metrics changing together produce one combined message.
+                message = (f"HVAC alert / recovery — {name}\n"
+                           f"Device: {data['device_id'].replace(':', '-')}\n"
+                           f"Received (UTC): {timestamp}\n"
+                           f"Temperature: {data['temperature_c']:.2f} C "
+                           f"(allowed {TEMP_MIN}-{TEMP_MAX})\n"
+                           f"RH: {data['humidity_rh']:.2f}% "
+                           f"(allowed {RH_MIN}-{RH_MAX})\n" + "\n".join(events))
+                conn.execute("INSERT INTO slack_outbox (message) VALUES (?)", (message,))
     # Log only after the entire transaction committed successfully.
     for event in events:
         print(f"[ALERT/RECOVERY] {timestamp} {name} ({data['device_id']}): {event}", flush=True)
     return row_id, timestamp
+
+
+def slack_url_from_environment():
+    """Accept only Slack HTTPS webhook endpoints; never print this secret URL."""
+    url = os.environ.get("HVAC_SLACK_WEBHOOK_URL", "").strip()
+    if not url:
+        return None
+    parts = urlsplit(url)
+    if (parts.scheme != "https" or parts.hostname not in
+            ("hooks.slack.com", "hooks.slack-gov.com") or
+            parts.netloc != parts.hostname or not parts.path.startswith("/services/")
+            or len(parts.path.split("/")) != 5 or
+            not all(parts.path.split("/")[2:]) or parts.query or parts.fragment):
+        raise ValueError("HVAC_SLACK_WEBHOOK_URL must be a Slack HTTPS incoming webhook URL")
+    return url
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Do not forward a webhook payload to an unexpected destination.
+        return None
+
+
+def send_slack(url, message):
+    """Return a sanitized error or None. Do not log exceptions containing the URL.
+
+    Explicit plain_text prevents sensor names from creating Slack mentions.
+    A timeout can happen after Slack accepted the message: retries may duplicate it.
+    """
+    body = json.dumps({"text": "HVAC alert / recovery", "blocks": [
+        {"type": "section", "text": {"type": "plain_text", "text": message}}
+    ]}).encode("utf-8")
+    request = urllib.request.Request(url, data=body,
+                                    headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.build_opener(NoRedirect).open(request, timeout=SLACK_TIMEOUT) as response:
+            if response.status == 200 and response.read(32).strip() == b"ok":
+                return None
+            return "Unexpected Slack response"
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        exc.close()
+        return f"Slack HTTP {status}"
+    except (OSError, urllib.error.URLError, ValueError):
+        return "Slack connection failed or timed out"
+
+
+def deliver_one_slack(url):
+    """One worker owns delivery. Network I/O never holds a SQLite writer lock."""
+    import time
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+        row = conn.execute("SELECT id, message FROM slack_outbox WHERE sent_at_utc IS NULL "
+                           "AND next_attempt <= ? ORDER BY id LIMIT 1", (time.time(),)).fetchone()
+    if row is None:
+        return False
+    error = send_slack(url, row[1])
+    with closing(sqlite3.connect(DB_PATH, timeout=10)) as conn:
+        with conn:
+            conn.execute("UPDATE slack_outbox SET attempts=attempts+1, next_attempt=?, "
+                         "sent_at_utc=?, last_error=? WHERE id=?",
+                         (time.time() + 60,
+                          None if error else datetime.now(timezone.utc).isoformat(), error, row[0]))
+    print(f"[SLACK] Message #{row[0]}: " +
+          (f"{error}; retry in 60 seconds" if error else "sent"), flush=True)
+    return True
+
+
+def slack_worker(url, stop):
+    while not stop.is_set():
+        try:
+            busy = deliver_one_slack(url)
+        except sqlite3.Error:
+            print("[SLACK] Queue database unavailable; will retry", flush=True)
+            busy = False
+        stop.wait(1 if busy else 2)
 
 
 def normalized_time(text):
@@ -214,6 +315,7 @@ class Receiver(BaseHTTPRequestHandler):
 
 
 def main():
+    global SLACK_ENABLED
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--recent", type=int, metavar="N",
                         help="Show the latest N saved readings, then exit")
@@ -222,10 +324,23 @@ def main():
     parser.add_argument("--name", help="Filter recent readings by current sensor name")
     parser.add_argument("--start", help="Inclusive ISO time with timezone offset")
     parser.add_argument("--end", help="Exclusive ISO time with timezone offset")
+    parser.add_argument("--test-slack", action="store_true",
+                        help="Send one clearly labeled test message, then exit")
     args = parser.parse_args()
     if args.recent is not None and args.recent < 1:
         parser.error("--recent must be at least 1")
     try:
+        if args.test_slack:
+            if args.set_name or args.recent is not None or any((args.device, args.name, args.start, args.end)):
+                raise ValueError("Use --test-slack separately from database commands")
+            url = slack_url_from_environment()
+            if not url:
+                raise ValueError("Set HVAC_SLACK_WEBHOOK_URL in this terminal first")
+            error = send_slack(url, "TEST — HVAC Slack connection test. No sensor alarm was triggered.")
+            if error:
+                parser.exit(1, error + "\n")
+            print("Slack test sent successfully. Check the configured channel.")
+            return
         start = normalized_time(args.start) if args.start else None
         end = normalized_time(args.end) if args.end else None
         if start and end and start >= end:
@@ -241,10 +356,20 @@ def main():
         if args.recent is not None:
             show_recent(args.recent, args.device, args.name, start, end)
             return
+        url = slack_url_from_environment()
+        SLACK_ENABLED = bool(url)
         server = ThreadingHTTPServer(("0.0.0.0", 8000), Receiver)
     except (OSError, sqlite3.Error, ValueError) as exc:
         parser.exit(1, f"Startup failed: {exc}\n")
     print(f"Receiver started on port 8000. Database: {DB_PATH}", flush=True)
+    stop = threading.Event()
+    worker = None
+    if url:
+        worker = threading.Thread(target=slack_worker, args=(url, stop), daemon=True)
+        worker.start()
+        print("Slack enabled; queued notifications retry after failures.", flush=True)
+    else:
+        print("Slack disabled: HVAC_SLACK_WEBHOOK_URL is not set. New alerts will not be queued.", flush=True)
     print("Press Ctrl+C to stop. Saved data will remain on disk.", flush=True)
     try:
         server.serve_forever()
@@ -252,6 +377,9 @@ def main():
         pass
     finally:
         server.server_close()
+        stop.set()
+        if worker:
+            worker.join(timeout=SLACK_TIMEOUT + 3)
 
 
 if __name__ == "__main__":
