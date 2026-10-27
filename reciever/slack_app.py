@@ -21,6 +21,8 @@ import math
 import hashlib
 import re
 import time
+import uuid
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import threading
 from collections import OrderedDict
 from io import BytesIO
@@ -152,6 +154,7 @@ HISTORY_RANGES = {"1h": ("Last 1 hour", 3600), "24h": ("Last 24 hours", 86400),
 # Cache already-uploaded images in this process. Identical raw samples/settings
 # reuse the same Slack file. Cached files remain available to older panels.
 IMAGE_CACHE = OrderedDict()
+FILE_UPLOADED_AT = {}  # Monotonic completion times; no persistence or extra scopes.
 UPLOAD_LOCK = threading.Lock()
 
 
@@ -183,15 +186,29 @@ def upload_plot(client, png, title):
             raise ValueError("Slack did not return an uploaded image ID.")
         file_id = files[0]["id"]
         IMAGE_CACHE[digest] = file_id
+        FILE_UPLOADED_AT[file_id] = time.monotonic()
         while len(IMAGE_CACHE) > 32:
-            IMAGE_CACHE.popitem(last=False)
+            _, old_id = IMAGE_CACHE.popitem(last=False)
+            FILE_UPLOADED_AT.pop(old_id, None)
         return file_id
 
 
-def history_blocks(device_id, range_key, now, settings, client=None, sensor_name="Sensor"):
-    label, duration = HISTORY_RANGES[range_key]
-    history = hvac_plot.load_history(receiver.DB_PATH, device_id, duration, now)
-    heading = f"History: {label}"
+def history_blocks(device_id, range_key, now, settings, client=None, sensor_name="Sensor",
+                   custom_start=None, custom_end=None, custom_zone="America/New_York"):
+    if range_key == "custom":
+        start, end = parse_custom_bounds(custom_start, custom_end)
+        label, duration = "Custom range", (end-start).total_seconds()
+        now = end
+        zone = ZoneInfo(custom_zone)
+        heading = (f"History: {start.astimezone(zone).strftime('%Y-%m-%d %H:%M %Z')} to "
+                   f"{end.astimezone(zone).strftime('%Y-%m-%d %H:%M %Z')}")
+    else:
+        label, duration = HISTORY_RANGES[range_key]
+        heading = f"History: {label}"
+    try:
+        history = hvac_plot.load_history(receiver.DB_PATH, device_id, duration, now)
+    except ValueError as exc:
+        return [{"type": "section", "text": plain(str(exc))}]
     if not history["points"]:
         return [{"type": "section", "text": plain(heading + "\nNo readings in this window.")}]
     try:
@@ -227,19 +244,28 @@ def history_blocks(device_id, range_key, now, settings, client=None, sensor_name
 def range_selector(range_key):
     options = [{"text": plain(label), "value": key}
                for key, (label, _) in HISTORY_RANGES.items()]
+    options.append({"text": plain("Custom dates..."), "value": "custom"})
     return {"type": "static_select", "action_id": "hvac_range_select",
             "placeholder": plain("History window"), "options": options,
             "initial_option": next(item for item in options if item["value"] == range_key)}
 
 
-def connection_panel(user_id=None, device_id=None, range_key="1h", client=None):
-    if range_key not in HISTORY_RANGES:
+def connection_panel(user_id=None, device_id=None, range_key="1h", client=None,
+                     custom_start=None, custom_end=None, custom_zone="America/New_York"):
+    if range_key == "custom":
+        parse_custom_bounds(custom_start, custom_end)
+    if range_key not in (*HISTORY_RANGES, "custom"):
         range_key = "1h"
     settings, sensor, reading, count = sensor_snapshot(device_id)
     now = datetime.now(timezone.utc)
     selected = sensor["device_id"] if sensor else (device_id or "")
+    context = {"device_id": selected, "range": range_key, "custom_start": custom_start,
+               "custom_end": custom_end, "custom_zone": custom_zone}
     buttons = [{"type": "button", "action_id": "hvac_test_refresh",
-                "text": plain("Refresh"), "value": json.dumps({"device_id": selected, "range": range_key})}]
+                "text": plain("Refresh"), "value": json.dumps(context)}]
+    if range_key == "custom":
+        buttons.append({"type": "button", "action_id": "hvac_custom_edit",
+                        "text": plain("Edit time range"), "value": json.dumps(context)})
     if user_id in receiver.SETTINGS_EDITORS:
         buttons.append({"type": "button", "action_id": "hvac_settings_open",
                         "text": plain("Set alert limits"), "value": "settings"})
@@ -262,7 +288,8 @@ def connection_panel(user_id=None, device_id=None, range_key="1h", client=None):
             "The selected sensor no longer exists. Select another sensor." if device_id else
             "No sensors registered yet. Wait for an upload, then click Refresh.")})
     if sensor:
-        blocks.extend(history_blocks(selected, range_key, now, settings, client, sensor["name"]))
+        blocks.extend(history_blocks(selected, range_key, now, settings, client, sensor["name"],
+                                     custom_start, custom_end, custom_zone))
     blocks.extend([
         {"type": "section", "text": plain(
             f"Alert limits (all sensors)\n"
@@ -277,16 +304,18 @@ def connection_panel(user_id=None, device_id=None, range_key="1h", client=None):
             "blocks": blocks}
 
 
-def panel_or_error(user_id, device_id=None, range_key="1h", client=None):
+def panel_or_error(user_id, device_id=None, range_key="1h", client=None,
+                   custom_start=None, custom_end=None, custom_zone="America/New_York"):
     try:
-        return connection_panel(user_id, device_id, range_key, client)
+        return connection_panel(user_id, device_id, range_key, client, custom_start, custom_end, custom_zone)
     except (sqlite3.Error, ValueError):
         # Keep a retry button so a temporary DB lock does not strand the panel.
         return {"response_type": "ephemeral", "text": "HVAC database unavailable.", "blocks": [
             {"type": "section", "text": plain(
                 "Database busy/unavailable. Ensure server.py is running in the same folder, then retry.")},
             {"type": "actions", "elements": [{"type": "button", "action_id": "hvac_test_refresh",
-             "text": plain("Retry"), "value": json.dumps({"device_id": device_id or "", "range": range_key})}]}]}
+             "text": plain("Retry"), "value": json.dumps({"device_id": device_id or "", "range": range_key,
+                "custom_start": custom_start, "custom_end": custom_end, "custom_zone": custom_zone})}]}]}
 
 
 def show_panel(ack, respond, command, client):
@@ -296,7 +325,8 @@ def show_panel(ack, respond, command, client):
 
 def action_context(body):
     """Carry the panel's choices in the refresh button, then apply the new action."""
-    context = {"device_id": None, "range": "1h"}
+    context = {"device_id": None, "range": "1h", "custom_start": None,
+               "custom_end": None, "custom_zone": "America/New_York"}
     for block in body.get("message", {}).get("blocks", []):
         for element in block.get("elements", []):
             if element.get("action_id") == "hvac_test_refresh":
@@ -312,14 +342,14 @@ def action_context(body):
             context["device_id"] = (action.get("selected_option") or {}).get("value")
         elif action_id == "hvac_range_select":
             context["range"] = (action.get("selected_option") or {}).get("value")
-        elif action_id == "hvac_test_refresh":
+        elif action_id in ("hvac_test_refresh", "hvac_custom_edit"):
             try:
                 saved = json.loads(action.get("value", "{}"))
                 if isinstance(saved, dict):
                     context.update({k: saved[k] for k in context if k in saved})
             except (ValueError, TypeError):
                 pass
-    if context["range"] not in HISTORY_RANGES:
+    if context["range"] not in (*HISTORY_RANGES, "custom"):
         context["range"] = "1h"
     if not isinstance(context["device_id"], str):
         context["device_id"] = None
@@ -332,7 +362,7 @@ def action_device_id(body):
 
 def slack_response_detail(response):
     """Expose Slack's actual rejection reason, without URLs or credentials."""
-    body = getattr(response, "body", None)
+    body = response if isinstance(response, dict) else getattr(response, "body", None)
     if body is None:
         body = getattr(response, "data", {})
     if isinstance(body, bytes):
@@ -378,6 +408,74 @@ def send_panel(respond, panel):
         print(f"[SLACK PANEL] HTTP {status}: {slack_response_detail(response)}", flush=True)
 
 
+def finish_plot_modal(client, view_id, image_blocks):
+    """Account for both API rejection and successful-but-not-yet-renderable files.
+
+    Slack does not report whether the user's client rendered an image. For new
+    files, allow a processing grace period and then refresh the image blocks twice
+    even after API success. This is a bounded workaround, not a readiness signal.
+    """
+    newest_upload = max((FILE_UPLOADED_AT.get(b.get("slack_file", {}).get("id"), 0)
+                         for b in image_blocks), default=0)
+    age = time.monotonic()-newest_upload if newest_upload else float("inf")
+    fresh_files = age < 60
+    if fresh_files and age < 8:
+        time.sleep(8-age)  # Loading modal already opened; no trigger_id is held.
+
+    def updated_view():
+        # New block IDs prompt Slack to rebuild the image elements on each update.
+        blocks = [{**block, "block_id": f"plot-{uuid.uuid4().hex}-{i}"}
+                  for i, block in enumerate(image_blocks)]
+        return {"type": "modal", "title": plain("HVAC plots"), "close": plain("Close"),
+                "blocks": [*blocks, {"type": "context", "elements": [plain("Snapshot from last Refresh.")]}]}
+
+    last_detail = "Unknown error"
+    accepted = False
+    for attempt, delay in enumerate((0, 1, 2, 4, 6)):
+        if delay:
+            time.sleep(delay)
+        try:
+            client.views_update(view_id=view_id, view=updated_view())
+            accepted = True
+            break
+        except Exception as exc:
+            response = getattr(exc, "response", None)
+            code = response.get("error") if response is not None else None
+            if code in ("not_found", "view_not_found"):
+                return
+            last_detail = slack_response_detail(response) if response is not None else type(exc).__name__
+            transient_image = code in ("invalid_arguments", "invalid_blocks") and any(
+                phrase in last_detail.lower() for phrase in
+                ("invalid slack file", "file_not_found", "file not found", "image_not_ready"))
+            if not transient_image:
+                break
+            if attempt == 0:
+                print("[SLACK PLOT MODAL] Waiting for Slack image processing; retrying automatically.", flush=True)
+    if accepted:
+        if fresh_files:
+            # A 200 response does not guarantee the client can load the preview.
+            # Reload without asking the user to close and reopen the modal.
+            for delay in (4, 8):
+                time.sleep(delay)
+                try:
+                    client.views_update(view_id=view_id, view=updated_view())
+                except Exception as exc:
+                    response = getattr(exc, "response", None)
+                    code = response.get("error") if response is not None else None
+                    if code not in ("not_found", "view_not_found"):
+                        print("[SLACK PLOT MODAL] Background image refresh unavailable; reopen View plots if needed.", flush=True)
+                    return
+        return
+    print(f"[SLACK PLOT MODAL] Unable to display plot after retries: {last_detail}", flush=True)
+    try:
+        client.views_update(view_id=view_id, view={
+            "type": "modal", "title": plain("HVAC plots"), "close": plain("Close"),
+            "blocks": [{"type": "section", "text": plain(
+                "Images are not available yet. Close this window and try View plots again shortly.")}]})
+    except Exception:
+        pass
+
+
 def open_plot(ack, body, client, respond):
     """No rendering/upload here: use the already prepared file and a fresh trigger."""
     ack()
@@ -399,9 +497,14 @@ def open_plot(ack, body, client, respond):
                 return
             image_blocks.append({"type": "image", "slack_file": {"id": file_id},
                                  "alt_text": str(plot.get("alt") or "HVAC history")[:500]})
-        client.views_open(trigger_id=body["trigger_id"], view={
+        # Open immediately without image references. The trigger is short-lived;
+        # file readiness is handled AFTER opening by updating this specific view.
+        opened = client.views_open(trigger_id=body["trigger_id"], view={
             "type": "modal", "title": plain("HVAC plots"), "close": plain("Close"),
-            "blocks": [*image_blocks, {"type": "context", "elements": [plain("Snapshot from last Refresh.")]}]})
+            "blocks": [{"type": "section", "text": plain("Loading plots...")}]})
+        view_id = opened["view"]["id"]
+        threading.Thread(target=finish_plot_modal, args=(client, view_id, image_blocks),
+                         daemon=True, name="hvac-plot-modal").start()
     except Exception as exc:
         response = getattr(exc, "response", None)
         detail = slack_response_detail(response) if response is not None else type(exc).__name__
@@ -414,7 +517,14 @@ def open_plot(ack, body, client, respond):
 def refresh_panel(ack, respond, body, client):
     ack()
     context = action_context(body)
-    panel = panel_or_error(body.get("user", {}).get("id"), context["device_id"], context["range"], client)
+    actions = body.get("actions", [])
+    if any(action.get("action_id") == "hvac_custom_edit" or
+           (action.get("action_id") == "hvac_range_select" and
+            (action.get("selected_option") or {}).get("value") == "custom") for action in actions):
+        open_custom_range(body, client, respond, context)
+        return
+    panel = panel_or_error(body.get("user", {}).get("id"), context["device_id"], context["range"], client,
+                           context["custom_start"], context["custom_end"], context["custom_zone"])
     panel["replace_original"] = True
     send_panel(respond, panel)
 
@@ -427,6 +537,155 @@ def sensor_options(ack, body):
         print("Sensor options unavailable; database busy/unavailable.", flush=True)
         options = []
     ack(options=options)
+
+
+# Retain the ephemeral panel responder only in memory. Slack private_metadata
+# contains a random lookup ID, never a response URL, token or other credential.
+CUSTOM_REQUESTS = OrderedDict()
+CUSTOM_REQUEST_LOCK = threading.Lock()
+CUSTOM_ZONES = ("America/New_York", "UTC")
+
+
+def parse_custom_bounds(start_text, end_text):
+    if not isinstance(start_text, str) or not isinstance(end_text, str):
+        raise ValueError("Select a custom start and end time first.")
+    start = datetime.fromisoformat(start_text)
+    end = datetime.fromisoformat(end_text)
+    if start.tzinfo is None or end.tzinfo is None or start >= end:
+        raise ValueError("Choose an end time after the start time.")
+    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+
+def local_time_to_utc(date_text, time_text, zone_name):
+    """Reject ambiguous/nonexistent DST wall times rather than guessing an hour."""
+    if zone_name not in CUSTOM_ZONES:
+        raise ValueError("Select New York time or UTC.")
+    naive = datetime.strptime(f"{date_text} {time_text}", "%Y-%m-%d %H:%M")
+    zone = ZoneInfo(zone_name)
+    candidates = set()
+    for fold in (0, 1):
+        utc = naive.replace(tzinfo=zone, fold=fold).astimezone(timezone.utc)
+        if utc.astimezone(zone).replace(tzinfo=None) == naive:
+            candidates.add(utc)
+    if not candidates:
+        raise ValueError("This time does not exist during the daylight-saving change. Choose another time.")
+    if len(candidates) > 1:
+        raise ValueError("This time occurs twice during the daylight-saving change. Select UTC instead.")
+    return candidates.pop()
+
+
+def custom_range_modal(context, ticket):
+    zone_name = context.get("custom_zone") or "America/New_York"
+    if zone_name not in CUSTOM_ZONES:
+        zone_name = "America/New_York"
+    zone = ZoneInfo(zone_name)
+    end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    start = end - timedelta(hours=1)
+    if context.get("custom_start") and context.get("custom_end"):
+        start, end = parse_custom_bounds(context["custom_start"], context["custom_end"])
+    blocks = [{"type": "section", "text": plain(
+        "Choose start and end times (24-hour clock). Start is included; end is excluded.")}]
+    zones = [{"text": plain("New York (EST/EDT)"), "value": "America/New_York"},
+             {"text": plain("UTC"), "value": "UTC"}]
+    blocks.append({"type": "input", "block_id": "plot_timezone", "label": plain("Time zone"),
+                   "element": {"type": "static_select", "action_id": "value", "options": zones,
+                               "initial_option": next(z for z in zones if z["value"] == zone_name)}})
+    for prefix, stamp in (("start", start.astimezone(zone)), ("end", end.astimezone(zone))):
+        blocks.append({"type": "input", "block_id": prefix+"_date", "label": plain(prefix.title()+" date"),
+                       "element": {"type": "datepicker", "action_id": "value", "initial_date": stamp.strftime("%Y-%m-%d")}})
+        blocks.append({"type": "input", "block_id": prefix+"_time", "label": plain(prefix.title()+" time (HH:MM)"),
+                       "element": {"type": "timepicker", "action_id": "value", "initial_time": stamp.strftime("%H:%M")}})
+    return {"type": "modal", "callback_id": "hvac_custom_range_save", "title": plain("Custom plot range"),
+            "submit": plain("View plots"), "close": plain("Cancel"),
+            "private_metadata": ticket, "blocks": blocks}
+
+
+def open_custom_range(body, client, respond, context):
+    ticket = uuid.uuid4().hex
+    try:
+        modal = custom_range_modal(context, ticket)
+        with CUSTOM_REQUEST_LOCK:
+            now = time.monotonic()
+            for key in list(CUSTOM_REQUESTS):
+                if now - CUSTOM_REQUESTS[key]["created"] > 900:
+                    del CUSTOM_REQUESTS[key]
+            CUSTOM_REQUESTS[ticket] = {"created": now, "user_id": body["user"]["id"],
+                                       "respond": respond, "context": dict(context)}
+            while len(CUSTOM_REQUESTS) > 100:
+                CUSTOM_REQUESTS.popitem(last=False)
+        client.views_open(trigger_id=body["trigger_id"], view=modal)
+    except Exception as exc:
+        with CUSTOM_REQUEST_LOCK:
+            CUSTOM_REQUESTS.pop(ticket, None)
+        message = "Run python -m pip install tzdata, then restart the app." if isinstance(exc, ZoneInfoNotFoundError) else "Unable to open time selection. Try again."
+        print(f"[CUSTOM RANGE] {type(exc).__name__}: {message}", flush=True)
+        respond(response_type="ephemeral", text=message)
+
+
+def complete_custom_range(client, view_id, request, context):
+    try:
+        panel = panel_or_error(request["user_id"], context["device_id"], "custom", client,
+                               context["custom_start"], context["custom_end"], context["custom_zone"])
+        panel["replace_original"] = True
+        send_panel(request["respond"], panel)
+        images = [block for block in panel.get("blocks", []) if block.get("type") == "image"]
+        if images:
+            finish_plot_modal(client, view_id, images)
+        else:
+            messages = [b["text"]["text"] for b in panel.get("blocks", [])
+                        if b.get("type") == "section" and b.get("text", {}).get("text", "").startswith("History:")]
+            client.views_update(view_id=view_id, view={"type": "modal", "title": plain("Custom plot range"),
+                "close": plain("Close"), "blocks": [{"type": "section", "text": plain(
+                    "\n".join(messages) or "Unable to load this range. Close and check the panel.")}]})
+    except Exception as exc:
+        print(f"[CUSTOM RANGE] Plot request failed ({type(exc).__name__}).", flush=True)
+        try:
+            client.views_update(view_id=view_id, view={"type": "modal", "title": plain("Custom plot range"),
+                "close": plain("Close"), "blocks": [{"type": "section", "text": plain(
+                    "Unable to display this range. Close and try again.")}]})
+        except Exception:
+            pass
+
+
+def save_custom_range(ack, body, view, client):
+    ticket = view.get("private_metadata", "")
+    with CUSTOM_REQUEST_LOCK:
+        request = CUSTOM_REQUESTS.get(ticket)
+    if not request or time.monotonic()-request["created"] > 900 or request["user_id"] != body.get("user", {}).get("id"):
+        ack(response_action="errors", errors={"start_date": "Session expired. Close and select Custom dates again."})
+        return
+    state = view.get("state", {}).get("values", {})
+    try:
+        zone_name = state["plot_timezone"]["value"]["selected_option"]["value"]
+        if zone_name not in CUSTOM_ZONES:
+            raise ValueError("Select New York time or UTC.")
+    except (KeyError, TypeError, ValueError):
+        ack(response_action="errors", errors={"plot_timezone": "Select New York time or UTC."})
+        return
+    stamps, errors = {}, {}
+    for prefix in ("start", "end"):
+        try:
+            stamps[prefix] = local_time_to_utc(state[prefix+"_date"]["value"]["selected_date"],
+                state[prefix+"_time"]["value"]["selected_time"], zone_name)
+        except ZoneInfoNotFoundError:
+            errors[prefix+"_time"] = "Install tzdata on the receiver PC, then restart the app."
+        except (KeyError, TypeError, ValueError) as exc:
+            errors[prefix+"_time"] = str(exc)[:180] or "Select a date and time."
+    if not errors and stamps["start"] >= stamps["end"]:
+        errors["end_time"] = "End time must be after start time."
+    if errors:
+        ack(response_action="errors", errors=errors)
+        return
+    context = dict(request["context"])
+    context.update({"range": "custom", "custom_start": stamps["start"].isoformat(),
+                    "custom_end": stamps["end"].isoformat(), "custom_zone": zone_name})
+    # Acknowledge before plotting/uploading. No SDK deadlines depend on plot time.
+    ack(response_action="update", view={"type": "modal", "title": plain("Custom plot range"),
+        "close": plain("Close"), "blocks": [{"type": "section", "text": plain("Loading plots...")}]})
+    with CUSTOM_REQUEST_LOCK:
+        CUSTOM_REQUESTS.pop(ticket, None)
+    threading.Thread(target=complete_custom_range, args=(client, view["id"], request, context),
+                     daemon=True, name="hvac-custom-range").start()
 
 
 FIELD_LABELS = {
@@ -552,6 +811,8 @@ def main():
         app.action("hvac_test_refresh")(refresh_panel)
         app.action("hvac_sensor_select")(refresh_panel)
         app.action("hvac_range_select")(refresh_panel)
+        app.action("hvac_custom_edit")(refresh_panel)
+        app.view("hvac_custom_range_save")(save_custom_range)
         app.options("hvac_sensor_select")(sensor_options)
         app.action("hvac_plot_open")(open_plot)
         app.action("hvac_settings_open")(open_settings)
