@@ -22,13 +22,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-# Inclusive comfort bounds. Physical validity is checked separately below.
+# Initial defaults only. After first startup, alert_settings in SQLite is authoritative.
 TEMP_MIN, TEMP_MAX = 20.0, 26.0
 RH_MIN, RH_MAX = 40.0, 60.0
 
 # Credentials stay in the process environment, never in the database or source.
 SLACK_ENABLED = False
 SLACK_TIMEOUT = 8
+
+# Only these Slack users may submit threshold changes. Checked again on save.
+SETTINGS_EDITORS = frozenset({"U09989EJ0D8", "U089R611C9X"})
+SETTING_FIELDS = ("temp_min", "temp_max", "rh_min", "rh_max")
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "hvac.db"
 
@@ -48,6 +52,19 @@ def init_database():
                     source_ip TEXT NOT NULL
                 )
             """)
+            conn.execute("""CREATE TABLE IF NOT EXISTS alert_settings (
+                id INTEGER PRIMARY KEY CHECK(id=1), temp_min REAL NOT NULL,
+                temp_max REAL NOT NULL, rh_min REAL NOT NULL, rh_max REAL NOT NULL,
+                version INTEGER NOT NULL, updated_at_utc TEXT NOT NULL,
+                updated_by TEXT NOT NULL)""")
+            conn.execute("INSERT OR IGNORE INTO alert_settings VALUES (1, ?, ?, ?, ?, 1, ?, ?)",
+                         (TEMP_MIN, TEMP_MAX, RH_MIN, RH_MAX,
+                          datetime.now(timezone.utc).isoformat(timespec="milliseconds"), "initial defaults"))
+            conn.execute("""CREATE TABLE IF NOT EXISTS settings_audit (
+                id INTEGER PRIMARY KEY, changed_at_utc TEXT NOT NULL,
+                changed_by TEXT NOT NULL, old_settings TEXT NOT NULL,
+                new_settings TEXT NOT NULL, version INTEGER NOT NULL,
+                request_id TEXT NOT NULL UNIQUE)""")
             # Separate identity table: changing a name never rewrites historical readings.
             # IF NOT EXISTS allows safe upgrades of an existing database.
             conn.execute("""CREATE TABLE IF NOT EXISTS sensors (
@@ -59,6 +76,9 @@ def init_database():
                 received_at_utc TEXT NOT NULL, device_id TEXT NOT NULL,
                 metric TEXT NOT NULL, status TEXT NOT NULL, value REAL NOT NULL,
                 FOREIGN KEY(reading_id) REFERENCES readings(id))""")
+            # Add a reason without dropping existing alerts or readings.
+            if "reason" not in {row[1] for row in conn.execute("PRAGMA table_info(alerts)")}:
+                conn.execute("ALTER TABLE alerts ADD COLUMN reason TEXT NOT NULL DEFAULT 'reading'")
             # Durable delivery queue. A crash/restart keeps unsent messages.
             # Existing alerts are deliberately not backfilled into this queue.
             conn.execute("""CREATE TABLE IF NOT EXISTS slack_outbox (
@@ -114,39 +134,137 @@ def save_reading(data, source_ip):
             """, (timestamp, data["device_id"], data["temperature_c"],
                   data["humidity_rh"], data.get("battery_v"), source_ip))
             row_id = cursor.lastrowid
-            events = []
-            for metric, low, high in (("temperature_c", TEMP_MIN, TEMP_MAX),
-                                      ("humidity_rh", RH_MIN, RH_MAX)):
-                value = data[metric]
-                status = "low" if value < low else "high" if value > high else "normal"
-                previous = conn.execute(
-                    "SELECT status FROM alert_state WHERE device_id=? AND metric=?",
-                    (data["device_id"], metric)).fetchone()
-                # Initial normal readings are quiet; initial abnormal readings alert.
-                if status != (previous[0] if previous else "normal"):
-                    conn.execute("INSERT INTO alerts (reading_id, received_at_utc, "
-                                 "device_id, metric, status, value) VALUES (?, ?, ?, ?, ?, ?)",
-                                 (row_id, timestamp, data["device_id"], metric, status, value))
-                    events.append(f"{metric}: {status} ({value}; bounds {low} to {high})")
-                conn.execute("INSERT OR REPLACE INTO alert_state VALUES (?, ?, ?)",
-                             (data["device_id"], metric, status))
-            name = conn.execute("SELECT name FROM sensors WHERE device_id=?",
-                                (data["device_id"],)).fetchone()[0]
-            if events and SLACK_ENABLED:
-                # Queue in the SAME transaction as the reading and state change.
-                # Both metrics changing together produce one combined message.
-                message = (f"HVAC alert / recovery — {name}\n"
-                           f"Device: {data['device_id'].replace(':', '-')}\n"
-                           f"Received (UTC): {timestamp}\n"
-                           f"Temperature: {data['temperature_c']:.2f} C "
-                           f"(allowed {TEMP_MIN}-{TEMP_MAX})\n"
-                           f"RH: {data['humidity_rh']:.2f}% "
-                           f"(allowed {RH_MIN}-{RH_MAX})\n" + "\n".join(events))
-                conn.execute("INSERT INTO slack_outbox (message) VALUES (?)", (message,))
+            settings = read_settings(conn)
+            events, name = evaluate_reading(conn, row_id, data, timestamp, timestamp,
+                                            settings, "reading", SLACK_ENABLED)
     # Log only after the entire transaction committed successfully.
     for event in events:
         print(f"[ALERT/RECOVERY] {timestamp} {name} ({data['device_id']}): {event}", flush=True)
     return row_id, timestamp
+
+
+def read_settings(conn=None):
+    """Read fresh on every use; shared SQLite makes changes visible across processes."""
+    if conn is None:
+        with closing(sqlite3.connect(DB_PATH, timeout=0.5)) as connection:
+            return read_settings(connection)
+    row = conn.execute("SELECT temp_min, temp_max, rh_min, rh_max, version, "
+                       "updated_at_utc, updated_by FROM alert_settings WHERE id=1").fetchone()
+    if row is None:
+        raise ValueError("Settings not initialized. Start the updated server first.")
+    return dict(zip((*SETTING_FIELDS, "version", "updated_at_utc", "updated_by"), row))
+
+
+def validate_settings(values):
+    """Return field-specific errors for Slack's modal; reject NaN and infinity."""
+    errors = {}
+    for field in SETTING_FIELDS:
+        value = values.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            errors[field] = "Enter a finite number."
+    if errors:
+        return errors
+    if values["temp_min"] < -273.15:
+        errors["temp_min"] = "Temperature cannot be below -273.15 C."
+    if values["temp_min"] >= values["temp_max"]:
+        errors["temp_max"] = "Maximum must be greater than minimum."
+    for field in ("rh_min", "rh_max"):
+        if not 0 <= values[field] <= 100:
+            errors[field] = "Relative humidity must be between 0 and 100%."
+    if values["rh_min"] >= values["rh_max"]:
+        errors["rh_max"] = "Maximum must be greater than minimum."
+    return errors
+
+
+def evaluate_reading(conn, row_id, data, observed_at, evaluated_at, settings, reason, notify):
+    """Update state and queue transitions inside the caller's transaction.
+
+    Re-evaluation references an existing reading; it never fabricates a new sample.
+    A recovery for one metric does not imply both metrics are normal.
+    """
+    events = []
+    for metric, low, high in (("temperature_c", settings["temp_min"], settings["temp_max"]),
+                              ("humidity_rh", settings["rh_min"], settings["rh_max"])):
+        value = data[metric]
+        status = "low" if value < low else "high" if value > high else "normal"
+        previous = conn.execute("SELECT status FROM alert_state WHERE device_id=? AND metric=?",
+                                (data["device_id"], metric)).fetchone()
+        if status != (previous[0] if previous else "normal"):
+            conn.execute("INSERT INTO alerts (reading_id, received_at_utc, device_id, metric, "
+                         "status, value, reason) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                         (row_id, evaluated_at, data["device_id"], metric, status, value, reason))
+            events.append(f"{metric}: {status} ({value}; bounds {low} to {high})")
+        conn.execute("INSERT OR REPLACE INTO alert_state VALUES (?, ?, ?)",
+                     (data["device_id"], metric, status))
+    row = conn.execute("SELECT name FROM sensors WHERE device_id=?", (data["device_id"],)).fetchone()
+    name = row[0] if row else data["device_id"]
+    if events and notify:
+        message = (f"HVAC alert / recovery — {name}\n"
+                   f"Device: {data['device_id'].replace(':', '-')}\n"
+                   f"Last reading (UTC): {observed_at}\n"
+                   f"Evaluated (UTC): {evaluated_at}\n"
+                   f"Reason: {reason}\n"
+                   f"Temperature: {data['temperature_c']:.2f} C "
+                   f"(allowed {settings['temp_min']}-{settings['temp_max']})\n"
+                   f"RH: {data['humidity_rh']:.2f}% "
+                   f"(allowed {settings['rh_min']}-{settings['rh_max']})\n" + "\n".join(events))
+        conn.execute("INSERT INTO slack_outbox (message) VALUES (?)", (message,))
+    return events, name
+
+
+class SettingsConflict(ValueError):
+    pass
+
+
+def update_settings(values, user_id, expected_version, request_id, notify=False):
+    """Atomic settings/audit/re-evaluation, with authorization and stale-form guard.
+
+    Short lock timeout and SQL deadline allow Slack to receive ack within 3 sec.
+    A duplicate view submission cannot produce a duplicate audit or notification.
+    """
+    if user_id not in SETTINGS_EDITORS:
+        raise PermissionError("Only the two configured project editors may change settings.")
+    errors = validate_settings(values)
+    if errors:
+        raise ValueError(" ".join(errors.values()))
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError("Missing settings request ID.")
+    import time
+    deadline = time.monotonic() + 1.5
+    with closing(sqlite3.connect(DB_PATH, timeout=0.5)) as conn:
+        conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            duplicate = conn.execute("SELECT version FROM settings_audit WHERE request_id=?",
+                                     (request_id,)).fetchone()
+            if duplicate:
+                return {"version": duplicate[0], "changed": False, "duplicate": True,
+                        "transitions": 0}
+            old = read_settings(conn)
+            if old["version"] != expected_version:
+                raise SettingsConflict("Settings changed since this form opened. Close it and reopen Settings.")
+            if all(old[key] == values[key] for key in SETTING_FIELDS):
+                return {"version": old["version"], "changed": False, "transitions": 0}
+            version = old["version"] + 1
+            now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            conn.execute("UPDATE alert_settings SET temp_min=?, temp_max=?, rh_min=?, rh_max=?, "
+                         "version=?, updated_at_utc=?, updated_by=? WHERE id=1",
+                         (*[values[key] for key in SETTING_FIELDS], version, now, user_id))
+            conn.execute("INSERT INTO settings_audit (changed_at_utc, changed_by, old_settings, "
+                         "new_settings, version, request_id) VALUES (?, ?, ?, ?, ?, ?)",
+                         (now, user_id, json.dumps({k: old[k] for k in SETTING_FIELDS}),
+                          json.dumps({k: values[k] for k in SETTING_FIELDS}), version, request_id))
+            rows = conn.execute("SELECT r.id, r.received_at_utc, r.device_id, r.temperature_c, "
+                                "r.humidity_rh FROM readings r JOIN "
+                                "(SELECT MAX(id) AS id FROM readings GROUP BY device_id) latest "
+                                "ON r.id=latest.id").fetchall()
+            transitions = 0
+            for row in rows:
+                data = dict(zip(("device_id", "temperature_c", "humidity_rh"), row[2:]))
+                events, _ = evaluate_reading(conn, row[0], data, row[1], now, values,
+                                             "threshold change: re-evaluated last stored reading", notify)
+                transitions += len(events)
+    return {"version": version, "changed": True, "transitions": transitions}
 
 
 def slack_url_from_environment():
