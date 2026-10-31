@@ -41,6 +41,60 @@ def plain(text):
     return {"type": "plain_text", "text": text}
 
 
+def markdown(text):
+    return {"type": "mrkdwn", "text": text, "verbatim": True}
+
+
+def safe_label(text):
+    # Sensor names are user data, never Slack mentions or formatting instructions.
+    text = str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return text.translate(str.maketrans({"*": "＊", "_": "＿", "~": "～", "`": "ˋ"})).replace("\n", " ")
+
+
+def freshness(reading, now):
+    if reading is None:
+        return "NO DATA"
+    try:
+        received = datetime.fromisoformat(reading["received_at_utc"].replace("Z", "+00:00"))
+        if received.tzinfo is None:
+            return "UNKNOWN AGE"
+        age = (now - received).total_seconds()
+        if age < -5:
+            return "CLOCK MISMATCH"
+        return "STALE" if age > stale_seconds() else "RECENT"
+    except (ValueError, TypeError, OverflowError):
+        return "UNKNOWN AGE"
+
+
+def sensor_overview(settings, rows, now):
+    # Chunk every row, not just the first page. Slack sections allow 3000 chars.
+    blocks = [{"type": "header", "text": plain("All sensors")}]
+    lines = []
+    for row in rows:
+        age = freshness(row if row["received_at_utc"] else None, now)
+        issues = []
+        if row["received_at_utc"]:
+            for value, low, high, label in (
+                (row["temperature_c"], settings["temp_min"], settings["temp_max"], "Temperature"),
+                (row["humidity_rh"], settings["rh_min"], settings["rh_max"], "RH")):
+                state = condition(value, low, high)
+                if state != "NORMAL":
+                    issues.append(label + (" low" if state == "LOW" else " high"))
+        status = ", ".join(issues) if issues else "Normal"
+        if age != "RECENT":
+            status = age.title() + (" · Last: " + status if row["received_at_utc"] else "")
+        icon = "⏳" if age != "RECENT" else ("⚠️" if issues else "✅")
+        battery = "—" if row["battery_v"] is None else f"{row['battery_v']:.3f} V"
+        # Keep the entire sensor name without exceeding Slack's section limit.
+        line = f"*{safe_label(row['name'])[:500]}* · {icon} {status} · 🔋 {battery}"
+        if sum(len(x)+1 for x in lines) + len(line) > 2800:
+            blocks.append({"type": "section", "text": markdown("\n".join(lines))})
+            lines = []
+        lines.append(line)
+    blocks.append({"type": "section", "text": markdown("\n".join(lines) or "No sensors registered yet.")})
+    return blocks
+
+
 def stale_seconds():
     """Presentation-only freshness cutoff, independent of temperature/RH alarms."""
     raw = os.environ.get("HVAC_DATA_STALE_SECONDS", "180")
@@ -100,7 +154,13 @@ def sensor_snapshot(device_id=None):
                     "FROM readings WHERE device_id=? "
                     "ORDER BY received_at_utc DESC, id DESC LIMIT 1",
                     (sensor["device_id"],)).fetchone()
-    return settings, dict(sensor) if sensor else None, dict(reading) if reading else None, count
+            overview = [dict(row) for row in conn.execute(
+                "SELECT s.device_id, s.name, r.received_at_utc, r.temperature_c, r.humidity_rh, r.battery_v "
+                "FROM sensors s LEFT JOIN readings r ON r.id = ("
+                "SELECT id FROM readings WHERE device_id=s.device_id "
+                "ORDER BY received_at_utc DESC, id DESC LIMIT 1) "
+                "ORDER BY s.name COLLATE NOCASE, s.device_id")]
+    return settings, dict(sensor) if sensor else None, dict(reading) if reading else None, count, overview
 
 
 def condition(value, low, high):
@@ -154,7 +214,8 @@ HISTORY_RANGES = {"1h": ("Last 1 hour", 3600), "24h": ("Last 24 hours", 86400),
 # Cache already-uploaded images in this process. Identical raw samples/settings
 # reuse the same Slack file. Cached files remain available to older panels.
 IMAGE_CACHE = OrderedDict()
-FILE_UPLOADED_AT = {}  # Monotonic completion times; no persistence or extra scopes.
+READY_PLOT_FILES = set()
+PLOT_FILE_LINKS = {}
 UPLOAD_LOCK = threading.Lock()
 
 
@@ -186,11 +247,41 @@ def upload_plot(client, png, title):
             raise ValueError("Slack did not return an uploaded image ID.")
         file_id = files[0]["id"]
         IMAGE_CACHE[digest] = file_id
-        FILE_UPLOADED_AT[file_id] = time.monotonic()
         while len(IMAGE_CACHE) > 32:
             _, old_id = IMAGE_CACHE.popitem(last=False)
-            FILE_UPLOADED_AT.pop(old_id, None)
+            READY_PLOT_FILES.discard(old_id)
+            PLOT_FILE_LINKS.pop(old_id, None)
         return file_id
+
+
+class PlotNotReady(ValueError):
+    pass
+
+
+def prepare_plot_files(client, file_ids):
+    """Check actual Slack thumbnail metadata BEFORE offering the View button.
+
+    Requires files:read. Preview metadata is a stronger server-side readiness
+    check than a fixed delay, but cannot certify rendering on the user's client.
+    """
+    pending = set(file_ids) - READY_PLOT_FILES
+    for delay in (0, 1, 2, 3, 5, 8):
+        if not pending:
+            return
+        if delay:
+            time.sleep(delay)
+        for file_id in tuple(pending):
+            info = client.files_info(file=file_id).get("file", {})
+            thumbnail = any(info.get(key) for key in
+                            ("thumb_160", "thumb_360", "thumb_480", "thumb_720", "thumb_800", "thumb_960", "thumb_1024"))
+            if info.get("mimetype", "").startswith("image/") and thumbnail:
+                READY_PLOT_FILES.add(file_id)
+                link = info.get("permalink")
+                if isinstance(link, str) and link.startswith("https://"):
+                    PLOT_FILE_LINKS[file_id] = link
+                pending.remove(file_id)
+    if pending:
+        raise PlotNotReady("Slack is still preparing the images. Click Refresh shortly.")
 
 
 def history_blocks(device_id, range_key, now, settings, client=None, sensor_name="Sensor",
@@ -224,12 +315,15 @@ def history_blocks(device_id, range_key, now, settings, client=None, sensor_name
             blocks.append({"type": "image", "slack_file": {"id": file_id},
                            "title": plain(plot["title"]),
                            "alt_text": f"{sensor_name[:100]} {plot['title']} raw history."})
+        prepare_plot_files(client, [b["slack_file"]["id"] for b in blocks if b.get("type") == "image"])
         return blocks
     except Exception as exc:
         response = getattr(exc, "response", None)
         code = response.get("error") if response is not None else None
         if code == "missing_scope":
-            message = "Add files:write under Bot Token Scopes, reinstall the app, and retry."
+            message = "Add files:read and files:write under Bot Token Scopes, reinstall the app, and retry."
+        elif isinstance(exc, PlotNotReady):
+            message = str(exc)
         elif isinstance(exc, ImportError):
             message = "Install plotting support: python -m pip install matplotlib"
         elif code:
@@ -251,16 +345,18 @@ def range_selector(range_key):
 
 
 def connection_panel(user_id=None, device_id=None, range_key="1h", client=None,
-                     custom_start=None, custom_end=None, custom_zone="America/New_York"):
+                     custom_start=None, custom_end=None, custom_zone="America/New_York",
+                     defer_history=False, panel_id=None):
     if range_key == "custom":
         parse_custom_bounds(custom_start, custom_end)
     if range_key not in (*HISTORY_RANGES, "custom"):
         range_key = "1h"
-    settings, sensor, reading, count = sensor_snapshot(device_id)
+    settings, sensor, reading, count, overview = sensor_snapshot(device_id)
     now = datetime.now(timezone.utc)
     selected = sensor["device_id"] if sensor else (device_id or "")
     context = {"device_id": selected, "range": range_key, "custom_start": custom_start,
-               "custom_end": custom_end, "custom_zone": custom_zone}
+               "custom_end": custom_end, "custom_zone": custom_zone,
+               "panel_id": panel_id or uuid.uuid4().hex}
     buttons = [{"type": "button", "action_id": "hvac_test_refresh",
                 "text": plain("Refresh"), "value": json.dumps(context)}]
     if range_key == "custom":
@@ -269,64 +365,163 @@ def connection_panel(user_id=None, device_id=None, range_key="1h", client=None,
     if user_id in receiver.SETTINGS_EDITORS:
         buttons.append({"type": "button", "action_id": "hvac_settings_open",
                         "text": plain("Set alert limits"), "value": "settings"})
-    blocks = [{"type": "header", "text": plain("HVAC Monitor - Latest status")}]
+    blocks = sensor_overview(settings, overview, now)
+    blocks.extend([{"type": "divider"}, {"type": "header", "text": plain("Selected sensor")}])
     if count:
         select = {"type": "external_select", "action_id": "hvac_sensor_select",
                   "min_query_length": 0, "placeholder": plain("Select or search sensor")}
         if sensor:
             select["initial_option"] = sensor_option(sensor["device_id"], sensor["name"])
-        blocks.append({"type": "section", "text": plain(f"Sensor ({count} registered)")})
         blocks.append({"type": "actions", "elements": [select]})
-    blocks.append({"type": "section", "text": plain("History window")})
-    blocks.append({"type": "actions", "elements": [range_selector(range_key)]})
     if sensor:
-        blocks.append({"type": "section", "text": plain(
-            f"Sensor: {sensor['name']}\nDevice: {sensor['device_id'].replace(':', '-')}\n" +
-            latest_reading_text(reading, settings, now))})
+        blocks.append({"type": "section", "text": markdown(f"*{safe_label(sensor['name'])[:500]}*")})
+        if reading:
+            blocks.append({"type": "section", "fields": [
+                markdown(f"*Temperature*\n*{reading['temperature_c']:.2f} °C* · " +
+                         condition(reading["temperature_c"], settings["temp_min"], settings["temp_max"])),
+                markdown(f"*Relative humidity*\n*{reading['humidity_rh']:.2f}%* · " +
+                         condition(reading["humidity_rh"], settings["rh_min"], settings["rh_max"]))]})
+            battery = "—" if reading["battery_v"] is None else f"{reading['battery_v']:.3f} V"
+            blocks.append({"type": "context", "elements": [plain(
+                f"{freshness(reading, now)} | Received (UTC): {reading['received_at_utc']} | Battery: {battery}")]})
+        else:
+            blocks.append({"type": "section", "text": plain("No readings yet.")})
+        blocks.append({"type": "context", "elements": [plain("Device: " + sensor["device_id"].replace(":", "-"))]})
     else:
         blocks.append({"type": "section", "text": plain(
             "The selected sensor no longer exists. Select another sensor." if device_id else
             "No sensors registered yet. Wait for an upload, then click Refresh.")})
+    blocks.extend([{"type": "divider"}, {"type": "section", "text": markdown("*History plots*")},
+                   {"type": "actions", "elements": [range_selector(range_key)]}])
+    if range_key == "custom":
+        start, end = parse_custom_bounds(custom_start, custom_end)
+        zone = ZoneInfo(custom_zone)
+        range_label = f"{start.astimezone(zone):%Y-%m-%d %H:%M %Z} → {end.astimezone(zone):%Y-%m-%d %H:%M %Z}"
+    else:
+        range_label = HISTORY_RANGES[range_key][0]
+    blocks.append({"type": "context", "elements": [plain(range_label)]})
+    history_request = None
     if sensor:
-        blocks.extend(history_blocks(selected, range_key, now, settings, client, sensor["name"],
-                                     custom_start, custom_end, custom_zone))
+        args = (selected, range_key, now, settings, client, sensor["name"],
+                custom_start, custom_end, custom_zone)
+        if defer_history:
+            blocks.append({"type": "section", "block_id": "hvac_history_pending",
+                           "text": plain(f"Loading plots — {sensor['name'][:500]}…")})
+            history_request = args
+        else:
+            blocks.extend(history_blocks(*args))
     blocks.extend([
-        {"type": "section", "text": plain(
-            f"Alert limits (all sensors)\n"
-            f"Temperature: {settings['temp_min']:g} to {settings['temp_max']:g} C\n"
-            f"Humidity: {settings['rh_min']:g} to {settings['rh_max']:g} %RH")},
+        {"type": "divider"},
+        {"type": "context", "elements": [markdown(
+            f"*Alert limits · all sensors*  |  Temperature {settings['temp_min']:g}–{settings['temp_max']:g} °C"
+            f"  |  RH {settings['rh_min']:g}–{settings['rh_max']:g}%")]},
         {"type": "context", "elements": [plain(
-            f"Refreshed (UTC): {now.strftime('%Y-%m-%d %H:%M:%S')} | Manual refresh" +
+            f"Refreshed (UTC): {now:%Y-%m-%d %H:%M:%S}" +
             ("" if user_id in receiver.SETTINGS_EDITORS else " | View only"))]},
         {"type": "actions", "elements": buttons},
     ])
     return {"response_type": "ephemeral", "text": "HVAC Monitor - Latest stored sensor status",
-            "blocks": blocks}
+            "blocks": blocks, "_history_request": history_request}
 
 
 def panel_or_error(user_id, device_id=None, range_key="1h", client=None,
-                   custom_start=None, custom_end=None, custom_zone="America/New_York"):
+                   custom_start=None, custom_end=None, custom_zone="America/New_York",
+                   defer_history=False, panel_id=None):
     try:
-        return connection_panel(user_id, device_id, range_key, client, custom_start, custom_end, custom_zone)
+        return connection_panel(user_id, device_id, range_key, client, custom_start, custom_end,
+                                custom_zone, defer_history, panel_id)
     except (sqlite3.Error, ValueError):
-        # Keep a retry button so a temporary DB lock does not strand the panel.
         return {"response_type": "ephemeral", "text": "HVAC database unavailable.", "blocks": [
-            {"type": "section", "text": plain(
-                "Database busy/unavailable. Ensure server.py is running in the same folder, then retry.")},
+            {"type": "section", "text": plain("Database busy/unavailable. Check server.py, then retry.")},
             {"type": "actions", "elements": [{"type": "button", "action_id": "hvac_test_refresh",
              "text": plain("Retry"), "value": json.dumps({"device_id": device_id or "", "range": range_key,
-                "custom_start": custom_start, "custom_end": custom_end, "custom_zone": custom_zone})}]}]}
+                "custom_start": custom_start, "custom_end": custom_end, "custom_zone": custom_zone,
+                "panel_id": panel_id or uuid.uuid4().hex})}]}]}
+
+
+# Each panel has its own generation and publication lock. Slow plotting never
+# holds this lock. Checking AND sending under the lock prevents stale results
+# from passing a check just before a newer request publishes its loading state.
+PANEL_REQUESTS = OrderedDict()
+PANEL_REQUEST_LOCK = threading.Lock()
+
+
+def begin_panel_request(context, order=None):
+    key = context.setdefault("panel_id", None) or uuid.uuid4().hex
+    context["panel_id"] = key
+    with PANEL_REQUEST_LOCK:
+        state = PANEL_REQUESTS.get(key)
+        if state is None:
+            state = {"lock": threading.Lock(), "token": None, "order": -1}
+            PANEL_REQUESTS[key] = state
+        PANEL_REQUESTS.move_to_end(key)
+        # Do not evict running requests: they still need their generation guard.
+        for old in list(PANEL_REQUESTS):
+            if len(PANEL_REQUESTS) <= 256:
+                break
+            if PANEL_REQUESTS[old].get("done") and old != key:
+                del PANEL_REQUESTS[old]
+    with state["lock"]:
+        order = time.time() if order is None else order
+        if order <= state["order"]:
+            return state, None
+        token = uuid.uuid4().hex
+        state.update(token=token, order=order, done=False)
+    return state, token
+
+
+def update_panel(respond, user_id, context, client, replace=True, order=None):
+    """Publish fresh text first, then add only this request's prepared images."""
+    state, token = begin_panel_request(context, order)
+    if token is None:
+        return None, state, token
+    panel = panel_or_error(user_id, context.get("device_id"), context.get("range", "1h"), client,
+                           context.get("custom_start"), context.get("custom_end"),
+                           context.get("custom_zone", "America/New_York"), True, context["panel_id"])
+    panel["replace_original"] = replace
+    with state["lock"]:
+        if state["token"] != token:
+            return None, state, token
+        send_panel(respond, panel)
+    args = panel.pop("_history_request", None)
+    if not args:
+        with state["lock"]:
+            if state["token"] == token:
+                state["done"] = True
+        return panel, state, token
+    with state["lock"]:
+        if state["token"] != token:
+            return None, state, token
+    try:
+        history = history_blocks(*args)
+    except Exception as exc:
+        print(f"[SLACK HISTORY] {type(exc).__name__}; retry from the panel.", flush=True)
+        history = [{"type": "section", "text": plain("Plots unavailable. Click Refresh to retry.")}]
+    final = dict(panel)
+    final["blocks"] = []
+    for block in panel["blocks"]:
+        if block.get("block_id") == "hvac_history_pending":
+            final["blocks"].extend(history)
+        else:
+            final["blocks"].append(block)
+    final["replace_original"] = True
+    with state["lock"]:
+        if state["token"] != token:
+            return None, state, token
+        send_panel(respond, final)
+        state["done"] = True
+    return final, state, token
 
 
 def show_panel(ack, respond, command, client):
     ack()
-    send_panel(respond, panel_or_error(command.get("user_id"), client=client))
+    update_panel(respond, command.get("user_id"), {}, client, replace=False)
 
 
 def action_context(body):
     """Carry the panel's choices in the refresh button, then apply the new action."""
     context = {"device_id": None, "range": "1h", "custom_start": None,
-               "custom_end": None, "custom_zone": "America/New_York"}
+               "custom_end": None, "custom_zone": "America/New_York", "panel_id": None}
     for block in body.get("message", {}).get("blocks", []):
         for element in block.get("elements", []):
             if element.get("action_id") == "hvac_test_refresh":
@@ -388,7 +583,7 @@ def send_panel(respond, panel):
     The observed response_url endpoint rejects these image blocks with
     HTTP 500 invalid_blocks. Do not keep submitting the same failing payload.
     """
-    outgoing = dict(panel)
+    outgoing = {k: v for k, v in panel.items() if not k.startswith("_")}
     blocks, plots = [], []
     for block in panel.get("blocks", []):
         if block.get("type") != "image":
@@ -398,9 +593,16 @@ def send_panel(respond, panel):
             if file_id:
                 plots.append({"file_id": file_id, "alt": block.get("alt_text", "HVAC history")[:250]})
     if plots:
-        blocks.append({"type": "actions", "elements": [{
+        plot_button = {"type": "actions", "elements": [{
             "type": "button", "action_id": "hvac_plot_open", "text": plain("View plots"),
-            "value": json.dumps({"plots": plots})}]})
+            "value": json.dumps({"plots": plots})}]}
+        insert_at = next((i for i, block in enumerate(blocks)
+                          if block.get("type") == "context" and any(
+                              "Alert limits · all sensors" in el.get("text", "")
+                              for el in block.get("elements", []))), len(blocks))
+        if insert_at and blocks[insert_at-1].get("type") == "divider":
+            insert_at -= 1
+        blocks.insert(insert_at, plot_button)
     outgoing["blocks"] = blocks
     response = respond(**outgoing)
     status = getattr(response, "status_code", 200)
@@ -409,71 +611,24 @@ def send_panel(respond, panel):
 
 
 def finish_plot_modal(client, view_id, image_blocks):
-    """Account for both API rejection and successful-but-not-yet-renderable files.
+    """Custom-range generation finishes with a fresh-trigger View button.
 
-    Slack does not report whether the user's client rendered an image. For new
-    files, allow a processing grace period and then refresh the image blocks twice
-    even after API success. This is a bounded workaround, not a readiness signal.
+    Avoid inserting new images into an already-visible loading modal, which has
+    repeatedly failed to render on this client despite successful API updates.
     """
-    newest_upload = max((FILE_UPLOADED_AT.get(b.get("slack_file", {}).get("id"), 0)
-                         for b in image_blocks), default=0)
-    age = time.monotonic()-newest_upload if newest_upload else float("inf")
-    fresh_files = age < 60
-    if fresh_files and age < 8:
-        time.sleep(8-age)  # Loading modal already opened; no trigger_id is held.
-
-    def updated_view():
-        # New block IDs prompt Slack to rebuild the image elements on each update.
-        blocks = [{**block, "block_id": f"plot-{uuid.uuid4().hex}-{i}"}
-                  for i, block in enumerate(image_blocks)]
-        return {"type": "modal", "title": plain("HVAC plots"), "close": plain("Close"),
-                "blocks": [*blocks, {"type": "context", "elements": [plain("Snapshot from last Refresh.")]}]}
-
-    last_detail = "Unknown error"
-    accepted = False
-    for attempt, delay in enumerate((0, 1, 2, 4, 6)):
-        if delay:
-            time.sleep(delay)
-        try:
-            client.views_update(view_id=view_id, view=updated_view())
-            accepted = True
-            break
-        except Exception as exc:
-            response = getattr(exc, "response", None)
-            code = response.get("error") if response is not None else None
-            if code in ("not_found", "view_not_found"):
-                return
-            last_detail = slack_response_detail(response) if response is not None else type(exc).__name__
-            transient_image = code in ("invalid_arguments", "invalid_blocks") and any(
-                phrase in last_detail.lower() for phrase in
-                ("invalid slack file", "file_not_found", "file not found", "image_not_ready"))
-            if not transient_image:
-                break
-            if attempt == 0:
-                print("[SLACK PLOT MODAL] Waiting for Slack image processing; retrying automatically.", flush=True)
-    if accepted:
-        if fresh_files:
-            # A 200 response does not guarantee the client can load the preview.
-            # Reload without asking the user to close and reopen the modal.
-            for delay in (4, 8):
-                time.sleep(delay)
-                try:
-                    client.views_update(view_id=view_id, view=updated_view())
-                except Exception as exc:
-                    response = getattr(exc, "response", None)
-                    code = response.get("error") if response is not None else None
-                    if code not in ("not_found", "view_not_found"):
-                        print("[SLACK PLOT MODAL] Background image refresh unavailable; reopen View plots if needed.", flush=True)
-                    return
-        return
-    print(f"[SLACK PLOT MODAL] Unable to display plot after retries: {last_detail}", flush=True)
+    plots = [{"file_id": b["slack_file"]["id"], "alt": b.get("alt_text", "HVAC plot")[:250]}
+             for b in image_blocks]
     try:
         client.views_update(view_id=view_id, view={
             "type": "modal", "title": plain("HVAC plots"), "close": plain("Close"),
-            "blocks": [{"type": "section", "text": plain(
-                "Images are not available yet. Close this window and try View plots again shortly.")}]})
-    except Exception:
-        pass
+            "blocks": [{"type": "section", "text": plain("Plots ready.")},
+                       {"type": "actions", "elements": [{"type": "button", "action_id": "hvac_plot_open",
+                        "text": plain("View plots"), "value": json.dumps({"plots": plots})}]}]})
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        code = response.get("error") if response is not None else None
+        if code not in ("not_found", "view_not_found"):
+            print("[SLACK PLOT MODAL] Unable to show ready button; use View plots on the panel.", flush=True)
 
 
 def open_plot(ack, body, client, respond):
@@ -497,14 +652,23 @@ def open_plot(ack, body, client, respond):
                 return
             image_blocks.append({"type": "image", "slack_file": {"id": file_id},
                                  "alt_text": str(plot.get("alt") or "HVAC history")[:500]})
-        # Open immediately without image references. The trigger is short-lived;
-        # file readiness is handled AFTER opening by updating this specific view.
-        opened = client.views_open(trigger_id=body["trigger_id"], view={
-            "type": "modal", "title": plain("HVAC plots"), "close": plain("Close"),
-            "blocks": [{"type": "section", "text": plain("Loading plots...")}]})
-        view_id = opened["view"]["id"]
-        threading.Thread(target=finish_plot_modal, args=(client, view_id, image_blocks),
-                         daemon=True, name="hvac-plot-modal").start()
+        # The file checks ran before the button appeared. Open a complete view
+        # directly on this fresh click, rather than replacing a loading view.
+        links = []
+        for i, plot in enumerate(plots):
+            link = PLOT_FILE_LINKS.get(plot["file_id"])
+            if link:
+                links.append({"type": "button", "action_id": f"hvac_file_link_{i}",
+                              "text": plain("Open temperature file" if i == 0 else "Open humidity file"),
+                              "url": link})
+        blocks = [*image_blocks]
+        if links:
+            blocks.append({"type": "actions", "elements": links})
+        view = {"type": "modal", "title": plain("HVAC plots"), "close": plain("Close"), "blocks": blocks}
+        if body.get("view"):
+            client.views_push(trigger_id=body["trigger_id"], view=view)
+        else:
+            client.views_open(trigger_id=body["trigger_id"], view=view)
     except Exception as exc:
         response = getattr(exc, "response", None)
         detail = slack_response_detail(response) if response is not None else type(exc).__name__
@@ -523,10 +687,13 @@ def refresh_panel(ack, respond, body, client):
             (action.get("selected_option") or {}).get("value") == "custom") for action in actions):
         open_custom_range(body, client, respond, context)
         return
-    panel = panel_or_error(body.get("user", {}).get("id"), context["device_id"], context["range"], client,
-                           context["custom_start"], context["custom_end"], context["custom_zone"])
-    panel["replace_original"] = True
-    send_panel(respond, panel)
+    try:
+        order = float(actions[0]["action_ts"])
+        if not math.isfinite(order):
+            order = None
+    except (KeyError, IndexError, TypeError, ValueError):
+        order = None
+    update_panel(respond, body.get("user", {}).get("id"), context, client, order=order)
 
 
 def sensor_options(ack, body):
@@ -624,10 +791,14 @@ def open_custom_range(body, client, respond, context):
 
 def complete_custom_range(client, view_id, request, context):
     try:
-        panel = panel_or_error(request["user_id"], context["device_id"], "custom", client,
-                               context["custom_start"], context["custom_end"], context["custom_zone"])
-        panel["replace_original"] = True
-        send_panel(request["respond"], panel)
+        panel, state, token = update_panel(request["respond"], request["user_id"], context, client)
+        with state["lock"]:
+            superseded = panel is None or state["token"] != token
+        if superseded:
+            client.views_update(view_id=view_id, view={"type": "modal", "title": plain("Custom plot range"),
+                "close": plain("Close"), "blocks": [{"type": "section", "text": plain(
+                    "A newer selection is active. Close and use the current panel.")}]})
+            return
         images = [block for block in panel.get("blocks", []) if block.get("type") == "image"]
         if images:
             finish_plot_modal(client, view_id, images)
@@ -815,6 +986,7 @@ def main():
         app.view("hvac_custom_range_save")(save_custom_range)
         app.options("hvac_sensor_select")(sensor_options)
         app.action("hvac_plot_open")(open_plot)
+        app.action(re.compile(r"^hvac_file_link_[0-9]+$"))(lambda ack: ack())
         app.action("hvac_settings_open")(open_settings)
         app.view("hvac_settings_save")(save_settings)
 

@@ -176,6 +176,57 @@ def validate_settings(values):
     return errors
 
 
+def alert_message(name, data, observed_at, evaluated_at, settings, reason, events):
+    """Format a durable Slack payload; presentation never changes alert state.
+
+    Keep changed metrics separate from current status: one metric recovering
+    does not mean the sensor has fully recovered. Plain-text identity/context
+    prevents names and device IDs from becoming mentions or custom emoji.
+    """
+    def plain(text):
+        return {"type": "plain_text", "text": text, "emoji": False}
+
+    def bold(text):
+        return {"type": "mrkdwn", "text": text, "verbatim": True}
+
+    metrics = (("temperature_c", "Temperature", "°C", "temp_min", "temp_max"),
+               ("humidity_rh", "RH", "%", "rh_min", "rh_max"))
+    statuses, changes, fields, readings = {}, [], [], []
+    recovered = False
+    for key, label, unit, low_key, high_key in metrics:
+        value, low, high = data[key], settings[low_key], settings[high_key]
+        status = "low" if value < low else "high" if value > high else "normal"
+        statuses[key] = status
+        if any(event.startswith(key + ":") for event in events):
+            change = "Recovered" if status == "normal" else "Too " + status
+            changes.append(f"*{label}: {change}*")
+            recovered = recovered or status == "normal"
+        fields.append(bold(f"*{label}*\n*{value:.2f} {unit}* · {status.upper()}\n"
+                           f"Allowed: {low:g}–{high:g} {unit}"))
+        readings.append(f"{label}: {value:.2f} {unit} ({status}; allowed {low:g}–{high:g} {unit})")
+    normal = all(status == "normal" for status in statuses.values())
+    title = "✅ HVAC recovery" if normal else ("⚠️ HVAC status update" if recovered else "🚨 HVAC alert")
+    if recovered and not normal:
+        changes.append("Other readings remain outside the limits.")
+    context = [plain("Device: " + data["device_id"].replace(":", "-")),
+               plain("Last reading (UTC): " + observed_at)]
+    if reason != "reading" or observed_at != evaluated_at:
+        context.append(plain(f"Evaluated (UTC): {evaluated_at} | Reason: {reason}"))
+    # Fallback text is also meaningful in notifications and screen readers.
+    display_name = name.replace(":", "-") if name == data["device_id"] else name
+    fallback = (f"{title} — {display_name}\n" + "; ".join(change.replace("*", "") for change in changes) +
+                "\n" + "; ".join(readings) + "\n" +
+                "\n".join(item["text"] for item in context))
+    payload = {"text": fallback, "mrkdwn": False, "blocks": [
+        {"type": "header", "text": plain(title)},
+        {"type": "header", "text": plain(display_name[:150])},
+        {"type": "section", "text": bold("\n".join(changes))},
+        {"type": "section", "fields": fields},
+        {"type": "context", "elements": context},
+    ]}
+    return json.dumps({"format": "hvac_alert_v1", "payload": payload}, ensure_ascii=False)
+
+
 def evaluate_reading(conn, row_id, data, observed_at, evaluated_at, settings, reason, notify):
     """Update state and queue transitions inside the caller's transaction.
 
@@ -199,15 +250,7 @@ def evaluate_reading(conn, row_id, data, observed_at, evaluated_at, settings, re
     row = conn.execute("SELECT name FROM sensors WHERE device_id=?", (data["device_id"],)).fetchone()
     name = row[0] if row else data["device_id"]
     if events and notify:
-        message = (f"HVAC alert / recovery — {name}\n"
-                   f"Device: {data['device_id'].replace(':', '-')}\n"
-                   f"Last reading (UTC): {observed_at}\n"
-                   f"Evaluated (UTC): {evaluated_at}\n"
-                   f"Reason: {reason}\n"
-                   f"Temperature: {data['temperature_c']:.2f} C "
-                   f"(allowed {settings['temp_min']}-{settings['temp_max']})\n"
-                   f"RH: {data['humidity_rh']:.2f}% "
-                   f"(allowed {settings['rh_min']}-{settings['rh_max']})\n" + "\n".join(events))
+        message = alert_message(name, data, observed_at, evaluated_at, settings, reason, events)
         conn.execute("INSERT INTO slack_outbox (message) VALUES (?)", (message,))
     return events, name
 
@@ -291,12 +334,20 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 def send_slack(url, message):
     """Return a sanitized error or None. Do not log exceptions containing the URL.
 
-    Explicit plain_text prevents sensor names from creating Slack mentions.
+    New alerts carry formatted blocks. Existing plain-text queue entries and
+    --test-slack still work, without reformatting user-controlled text.
     A timeout can happen after Slack accepted the message: retries may duplicate it.
     """
-    body = json.dumps({"text": "HVAC alert / recovery", "blocks": [
+    payload = {"text": "HVAC alert / recovery", "blocks": [
         {"type": "section", "text": {"type": "plain_text", "text": message}}
-    ]}).encode("utf-8")
+    ]}
+    try:
+        stored = json.loads(message)
+        if isinstance(stored, dict) and stored.get("format") == "hvac_alert_v1":
+            payload = stored["payload"]
+    except (ValueError, TypeError, KeyError):
+        pass
+    body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(url, data=body,
                                     headers={"Content-Type": "application/json"})
     try:
