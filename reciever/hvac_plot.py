@@ -50,6 +50,47 @@ def load_history(db_path, device_id, seconds, now):
     return {"start": start, "end": end, "points": points, "invalid": invalid}
 
 
+def load_weather(db_path, start, end):
+    """Read NWS/KABE by observation time; never substitute fetch time or fill gaps."""
+    uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+    try:
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.5)) as conn:
+            if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='weather_observations'").fetchone():
+                return {"points": [], "note": "Outdoor history not available yet. Start weather_collector.py."}
+            rows = conn.execute(
+                "SELECT observed_at_utc, temperature_c, humidity_rh FROM weather_observations "
+                "WHERE source='NWS' AND station_id='KABE' AND observed_at_utc>=? AND observed_at_utc<? "
+                "ORDER BY observed_at_utc LIMIT ?",
+                (start.isoformat(timespec="milliseconds"),
+                 (end + timedelta(milliseconds=1)).isoformat(timespec="milliseconds"), MAX_ROWS+1)).fetchall()
+        if len(rows) > MAX_ROWS:
+            return {"points": [], "note": "Too many outdoor observations; choose a shorter window."}
+        points = []
+        for ts, t, rh in rows:
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if dt.tzinfo is None or not start <= dt < end:
+                    continue
+                vals = []
+                for value in (t, rh):
+                    v = float(value) if value is not None else float("nan")
+                    vals.append(v if math.isfinite(v) else float("nan"))
+                points.append((dt.astimezone(timezone.utc), *vals))
+            except (TypeError, ValueError, OverflowError):
+                continue
+        note = (f"Outdoor reference: NWS / KABE | {len(points)} observations in this window. "
+                "Observation times; not minute-by-minute measurements.") if points else "No outdoor observations in this time window."
+        if points:
+            age = (end-points[-1][0]).total_seconds()/60
+            if age > 120:
+                note += f" Last observation is {age:.0f} min before the window end."
+            if any(not math.isfinite(p[i]) for p in points for i in (1, 2)):
+                note += " Some outdoor values are missing."
+        return {"points": points, "note": note}
+    except sqlite3.Error:
+        return {"points": [], "note": "Outdoor history temporarily unavailable; indoor history shown."}
+
+
 def axis_limits(values, minimum_span):
     """Zoom around data, never force zero or distant alarm bounds into view."""
     low, high = min(values), max(values)
@@ -76,7 +117,7 @@ def plot_series(points, metric, gap_seconds):
     return xs, ys, gaps
 
 
-def render_history(history, sensor_name, range_label, settings, gap_seconds=180):
+def render_history(history, sensor_name, range_label, settings, gap_seconds=180, weather=None):
     """Return separate high-resolution temperature and RH PNGs plus raw-sample stats.
 
     Both y axes zoom independently. Current alarm bounds are drawn only if they
@@ -88,6 +129,7 @@ def render_history(history, sensor_name, range_label, settings, gap_seconds=180)
         return None
     temperatures, humidities = [p[1] for p in points], [p[2] for p in points]
     stats = {"temperature": sample_stats(temperatures), "humidity": sample_stats(humidities)}
+    outdoor = (weather or {}).get("points", [])
     panels = []
     with PLOT_LOCK:
         from matplotlib.figure import Figure
@@ -108,8 +150,13 @@ def render_history(history, sensor_name, range_label, settings, gap_seconds=180)
             values = temperatures if metric == 1 else humidities
             xs, ys, gap_count = plot_series(points, metric, gap_seconds)
             ax.plot(xs, ys, color=color, linewidth=1.4, marker=".",
-                    markersize=4 if len(points) < 500 else 2, label="Raw readings", zorder=3)
-            limits = axis_limits(values, min_span)
+                    markersize=4 if len(points) < 500 else 2, label="Indoor sensor", zorder=3)
+            outdoor_values = [p[metric] for p in outdoor if math.isfinite(p[metric])]
+            if outdoor_values:
+                wx, wy, _ = plot_series(outdoor, metric, 7200)
+                ax.plot(wx, wy, color="#e87916", linewidth=1.3, linestyle="--",
+                        marker="o", markersize=4, label="Outdoor: NWS / KABE", zorder=2)
+            limits = axis_limits(values + outdoor_values, min_span)
             for caption, field in (("Lower limit", low_key), ("Upper limit", high_key)):
                 if limits[0] <= settings[field] <= limits[1]:
                     ax.axhline(settings[field], color="#b23a3a", linestyle="--", linewidth=1,
@@ -117,7 +164,7 @@ def render_history(history, sensor_name, range_label, settings, gap_seconds=180)
             ax.set_ylim(*limits)
             span = (points[-1][0] - points[0][0]).total_seconds()
             padding = timedelta(seconds=max(30, span * .025))
-            ax.set_xlim(points[0][0]-padding, points[-1][0]+padding)
+            ax.set_xlim(history["start"], history["end"])
             locator = AutoDateLocator(minticks=4, maxticks=6, tz=timezone.utc)
             ax.xaxis.set_major_locator(locator)
             ax.xaxis.set_major_formatter(DateFormatter("%m-%d\n%H:%M", tz=timezone.utc))
@@ -131,7 +178,7 @@ def render_history(history, sensor_name, range_label, settings, gap_seconds=180)
                 ax.spines[side].set_visible(False)
             st = stats[key]
             fig.suptitle(f"{safe_name} | {title}", fontsize=16, fontweight="bold", y=.97)
-            summary = (f"{range_label} | Min {st['min']:.3f} | Max {st['max']:.3f} {unit}\n"
+            summary = (f"{range_label} | Indoor min {st['min']:.3f} | Max {st['max']:.3f} {unit}\n"
                        f"Peak-to-peak {st['ptp']:.3f} | Std {st['std']:.3f} {unit}")
             ax.set_title(summary, loc="left", fontsize=12, pad=10)
             ax.set_ylabel(unit, fontsize=12)
@@ -140,10 +187,13 @@ def render_history(history, sensor_name, range_label, settings, gap_seconds=180)
                       f"Auto-scaled axes; no averaging. Gaps > {gap_seconds:g} s not joined ({gap_count} gaps).\n"
                       f"Current limits {settings[low_key]:g} to {settings[high_key]:g} {unit}; off-scale limits omitted. "
                       "Std: population std.")
+            if weather is not None:
+                footer += "\nOutdoor: NWS/KABE airport reference; gaps > 2 h not joined. "
+                footer += f"{len(outdoor_values)} valid observations." if outdoor_values else "No valid outdoor data in window."
             if history["invalid"]:
                 footer += f" Skipped invalid rows: {history['invalid']}."
             fig.text(.09, .025, footer, fontsize=8.5, color="#455a64", va="bottom")
-            fig.subplots_adjust(left=.10, right=.98, top=.74, bottom=.25)
+            fig.subplots_adjust(left=.10, right=.98, top=.74, bottom=.29)
             buffer = BytesIO()
             fig.savefig(buffer, format="png", dpi=300, facecolor="white",
                         metadata={"Software": "HVAC Monitor"})

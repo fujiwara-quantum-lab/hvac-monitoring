@@ -303,10 +303,12 @@ def history_blocks(device_id, range_key, now, settings, client=None, sensor_name
     if not history["points"]:
         return [{"type": "section", "text": plain(heading + "\nNo readings in this window.")}]
     try:
-        result = hvac_plot.render_history(history, sensor_name, label, settings, gap_seconds())
+        weather = hvac_plot.load_weather(receiver.DB_PATH, history["start"], history["end"])
+        result = hvac_plot.render_history(history, sensor_name, label, settings, gap_seconds(), weather=weather)
         t, rh = result["stats"]["temperature"], result["stats"]["humidity"]
         heading += (f" | {t['n']} raw samples\n"
                     f"Peak-to-peak: temperature {t['ptp']:.3f} C; humidity {rh['ptp']:.3f} %RH")
+        heading += "\n" + weather["note"]
         if client is None:
             return [{"type": "section", "text": plain(heading + "\nConnect the Slack app to display the image.")}]
         blocks = [{"type": "section", "text": plain(heading)}]
@@ -314,7 +316,7 @@ def history_blocks(device_id, range_key, now, settings, client=None, sensor_name
             file_id = upload_plot(client, plot["png"], f"{sensor_name[:70]} - {plot['title']} - {label}")
             blocks.append({"type": "image", "slack_file": {"id": file_id},
                            "title": plain(plot["title"]),
-                           "alt_text": f"{sensor_name[:100]} {plot['title']} raw history."})
+                           "alt_text": f"{sensor_name[:100]} {plot['title']} indoor history with NWS/KABE outdoor reference."})
         prepare_plot_files(client, [b["slack_file"]["id"] for b in blocks if b.get("type") == "image"])
         return blocks
     except Exception as exc:

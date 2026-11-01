@@ -2,12 +2,12 @@
 setlocal
 cd /d "%~dp0"
 
-rem Both programs inherit this folder and your Windows user environment variables.
+rem All three programs inherit this folder and your Windows user environment variables.
 rem hvac_plot.py is imported by slack_app.py; it is not a background service.
-for %%F in (server.py slack_app.py hvac_plot.py) do (
+for %%F in (server.py slack_app.py hvac_plot.py weather_collector.py) do (
     if not exist "%%F" (
         echo Missing file: %%F
-        echo Put this launcher beside server.py, slack_app.py and hvac_plot.py.
+        echo Put this launcher beside server.py, slack_app.py, hvac_plot.py and weather_collector.py.
         goto failed
     )
 )
@@ -38,13 +38,15 @@ if not defined HVAC_SLACK_WEBHOOK_URL (
     goto failed
 )
 
-rem Prepare the shared schema before Slack starts, avoiding a startup race.
+rem Prepare the shared schema before Slack and the weather collector start, avoiding a startup race.
 python -c "import server; server.init_database(); server.read_settings(); print('Database ready.')"
 if errorlevel 1 goto failed
 
 start "HVAC Receiver" /D "%~dp0" "%ComSpec%" /d /k python -u server.py
 if errorlevel 1 goto failed
 start "HVAC Slack App" /D "%~dp0" "%ComSpec%" /d /k python -u slack_app.py
+if errorlevel 1 goto failed
+start "HVAC Weather Collector" /D "%~dp0" "%ComSpec%" /d /k python -u weather_collector.py
 if errorlevel 1 goto failed
 exit /b 0
 
