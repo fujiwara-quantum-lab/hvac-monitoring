@@ -346,6 +346,34 @@ def range_selector(range_key):
             "initial_option": next(item for item in options if item["value"] == range_key)}
 
 
+# Context is attached to both selector block IDs. Ephemeral interactions may
+# omit message.blocks and companion state; never depend on those for identity.
+SELECTOR_CONTEXTS = OrderedDict()
+SELECTOR_CONTEXT_LOCK = threading.Lock()
+
+
+def remember_selector_context(context):
+    token = uuid.uuid4().hex
+    with SELECTOR_CONTEXT_LOCK:
+        SELECTOR_CONTEXTS[token] = dict(context)
+        while len(SELECTOR_CONTEXTS) > 4096:
+            SELECTOR_CONTEXTS.popitem(last=False)
+    return token
+
+
+def selector_context(body):
+    for action in body.get("actions", []):
+        block_id = action.get("block_id", "")
+        if block_id.startswith("hvac_choice:"):
+            token = block_id.split(":")[1]
+            with SELECTOR_CONTEXT_LOCK:
+                saved = SELECTOR_CONTEXTS.get(token)
+                if saved is not None:
+                    return dict(saved)
+            raise ValueError("Panel expired. Run /hvac again to open a new panel.")
+    return None
+
+
 def connection_panel(user_id=None, device_id=None, range_key="1h", client=None,
                      custom_start=None, custom_end=None, custom_zone="America/New_York",
                      defer_history=False, panel_id=None):
@@ -359,6 +387,7 @@ def connection_panel(user_id=None, device_id=None, range_key="1h", client=None,
     context = {"device_id": selected, "range": range_key, "custom_start": custom_start,
                "custom_end": custom_end, "custom_zone": custom_zone,
                "panel_id": panel_id or uuid.uuid4().hex}
+    selector_token = remember_selector_context(context)
     buttons = [{"type": "button", "action_id": "hvac_test_refresh",
                 "text": plain("Refresh"), "value": json.dumps(context)}]
     if range_key == "custom":
@@ -374,7 +403,7 @@ def connection_panel(user_id=None, device_id=None, range_key="1h", client=None,
                   "min_query_length": 0, "placeholder": plain("Select or search sensor")}
         if sensor:
             select["initial_option"] = sensor_option(sensor["device_id"], sensor["name"])
-        blocks.append({"type": "actions", "elements": [select]})
+        blocks.append({"type": "actions", "block_id": f"hvac_choice:{selector_token}:sensor", "elements": [select]})
     if sensor:
         blocks.append({"type": "section", "text": markdown(f"*{safe_label(sensor['name'])[:500]}*")})
         if reading:
@@ -394,7 +423,7 @@ def connection_panel(user_id=None, device_id=None, range_key="1h", client=None,
             "The selected sensor no longer exists. Select another sensor." if device_id else
             "No sensors registered yet. Wait for an upload, then click Refresh.")})
     blocks.extend([{"type": "divider"}, {"type": "section", "text": markdown("*History plots*")},
-                   {"type": "actions", "elements": [range_selector(range_key)]}])
+                   {"type": "actions", "block_id": f"hvac_choice:{selector_token}:range", "elements": [range_selector(range_key)]}])
     if range_key == "custom":
         start, end = parse_custom_bounds(custom_start, custom_end)
         zone = ZoneInfo(custom_zone)
@@ -473,7 +502,7 @@ def begin_panel_request(context, order=None):
 
 
 def update_panel(respond, user_id, context, client, replace=True, order=None):
-    """Publish fresh text first, then add only this request's prepared images."""
+    """Send one initial command response; update existing action panels in stages."""
     state, token = begin_panel_request(context, order)
     if token is None:
         return None, state, token
@@ -484,11 +513,17 @@ def update_panel(respond, user_id, context, client, replace=True, order=None):
     with state["lock"]:
         if state["token"] != token:
             return None, state, token
-        send_panel(respond, panel)
+        # Slash-command response URLs do not identify an existing panel to
+        # replace. Send only the finished panel on first open. Action response
+        # URLs identify their source message and support staged replacement.
+        if replace:
+            send_panel(respond, panel)
     args = panel.pop("_history_request", None)
     if not args:
         with state["lock"]:
             if state["token"] == token:
+                if not replace:
+                    send_panel(respond, panel)
                 state["done"] = True
         return panel, state, token
     with state["lock"]:
@@ -506,7 +541,7 @@ def update_panel(respond, user_id, context, client, replace=True, order=None):
             final["blocks"].extend(history)
         else:
             final["blocks"].append(block)
-    final["replace_original"] = True
+    final["replace_original"] = replace
     with state["lock"]:
         if state["token"] != token:
             return None, state, token
@@ -521,31 +556,53 @@ def show_panel(ack, respond, command, client):
 
 
 def action_context(body):
-    """Carry the panel's choices in the refresh button, then apply the new action."""
+    """Merge saved metadata, displayed defaults, live state, then the new action."""
     context = {"device_id": None, "range": "1h", "custom_start": None,
                "custom_end": None, "custom_zone": "America/New_York", "panel_id": None}
-    for block in body.get("message", {}).get("blocks", []):
-        for element in block.get("elements", []):
-            if element.get("action_id") == "hvac_test_refresh":
-                try:
-                    saved = json.loads(element.get("value", "{}"))
-                    if isinstance(saved, dict):
-                        context.update({k: saved[k] for k in context if k in saved})
-                except (ValueError, TypeError):
-                    pass
+
+    def saved_context(element):
+        if element.get("action_id") not in ("hvac_test_refresh", "hvac_custom_edit"):
+            return
+        try:
+            saved = json.loads(element.get("value", "{}"))
+            if isinstance(saved, dict):
+                context.update({k: saved[k] for k in context if k in saved})
+        except (ValueError, TypeError):
+            pass
+
+    def selection(action_id, element, field="selected_option"):
+        key = {"hvac_sensor_select": "device_id", "hvac_range_select": "range"}.get(action_id)
+        option = element.get(field)
+        value = option.get("value") if isinstance(option, dict) else None
+        # Missing/null selections must not erase the saved companion choice.
+        if key and isinstance(value, str) and value:
+            context[key] = value
+
+    elements = []
+    for block in (body.get("message") or {}).get("blocks", []):
+        elements.extend(block.get("elements", []))
+        if isinstance(block.get("accessory"), dict):
+            elements.append(block["accessory"])
+    for element in elements:
+        saved_context(element)
     for action in body.get("actions", []):
-        action_id = action.get("action_id")
-        if action_id == "hvac_sensor_select":
-            context["device_id"] = (action.get("selected_option") or {}).get("value")
-        elif action_id == "hvac_range_select":
-            context["range"] = (action.get("selected_option") or {}).get("value")
-        elif action_id in ("hvac_test_refresh", "hvac_custom_edit"):
-            try:
-                saved = json.loads(action.get("value", "{}"))
-                if isinstance(saved, dict):
-                    context.update({k: saved[k] for k in context if k in saved})
-            except (ValueError, TypeError):
-                pass
+        saved_context(action)
+    for element in elements:
+        selection(element.get("action_id"), element, "initial_option")
+    # Slack sends the current values of BOTH selectors, not just the changed
+    # control. These take precedence over older message/button snapshots.
+    for values in (body.get("state") or {}).get("values", {}).values():
+        if isinstance(values, dict):
+            for action_id, element in values.items():
+                if isinstance(element, dict):
+                    selection(action_id, element)
+    # The exact rendered panel snapshot is authoritative for the companion
+    # choice. Apply only the newly changed selector on top of that snapshot.
+    remembered = selector_context(body)
+    if remembered is not None:
+        context.update(remembered)
+    for action in body.get("actions", []):
+        selection(action.get("action_id"), action)
     if context["range"] not in (*HISTORY_RANGES, "custom"):
         context["range"] = "1h"
     if not isinstance(context["device_id"], str):
@@ -682,7 +739,11 @@ def open_plot(ack, body, client, respond):
 
 def refresh_panel(ack, respond, body, client):
     ack()
-    context = action_context(body)
+    try:
+        context = action_context(body)
+    except ValueError as exc:
+        respond(response_type="ephemeral", text=str(exc))
+        return
     actions = body.get("actions", [])
     if any(action.get("action_id") == "hvac_custom_edit" or
            (action.get("action_id") == "hvac_range_select" and

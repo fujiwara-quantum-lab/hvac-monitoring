@@ -10,6 +10,7 @@ readings taken without a battery; it is not an estimate of charge percentage.
 import argparse
 import json
 import math
+import re
 import os
 import threading
 import urllib.request
@@ -30,8 +31,51 @@ RH_MIN, RH_MAX = 40.0, 60.0
 SLACK_ENABLED = False
 SLACK_TIMEOUT = 8
 
-# Only these Slack users may submit threshold changes. Checked again on save.
-SETTINGS_EDITORS = frozenset({"U09989EJ0D8", "U089R611C9X"})
+# Defaults apply only until an explicit local permissions file is created.
+DEFAULT_SETTINGS_EDITORS = frozenset({"U09989EJ0D8", "U089R611C9X"})
+EDITORS_PATH = Path(__file__).resolve().parent / "data" / "settings_editors.json"
+
+
+def read_editors():
+    if not EDITORS_PATH.exists():
+        return DEFAULT_SETTINGS_EDITORS
+    try:
+        data = json.loads(EDITORS_PATH.read_text(encoding="utf-8"))
+        ids = data["settings_editors"]
+        if not isinstance(ids, list) or any(
+                not isinstance(uid, str) or not re.fullmatch(r"[UW][A-Z0-9]{8,}", uid)
+                for uid in ids):
+            raise ValueError
+        return frozenset(ids)
+    except (OSError, ValueError, KeyError, TypeError):
+        raise ValueError("Invalid data/settings_editors.json; repair the file before restarting.") from None
+
+
+def manage_editors(add=None, remove=None):
+    editors = set(read_editors())
+    uid = add or remove
+    if uid is not None:
+        uid = uid.strip().upper()
+        if not re.fullmatch(r"[UW][A-Z0-9]{8,}", uid):
+            raise ValueError("Use a Slack member ID such as U0123456789, not a name or email.")
+        if add:
+            editors.add(uid)
+        else:
+            editors.discard(uid)
+        EDITORS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary = EDITORS_PATH.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"settings_editors": sorted(editors)}, indent=2)+"\n", encoding="utf-8")
+        temporary.replace(EDITORS_PATH)
+    print("Alert threshold editors:")
+    for editor in sorted(editors):
+        print("  " + editor)
+    if not editors:
+        print("  (none; use --add-editor to grant access)")
+    if uid is not None:
+        print("Saved. Restart slack_app.py and server.py to apply the new permissions.")
+
+
+SETTINGS_EDITORS = read_editors()
 SETTING_FIELDS = ("temp_min", "temp_max", "rh_min", "rh_max")
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "hvac.db"
@@ -177,52 +221,49 @@ def validate_settings(values):
 
 
 def alert_message(name, data, observed_at, evaluated_at, settings, reason, events):
-    """Format a durable Slack payload; presentation never changes alert state.
+    """Compact presentation; alert evaluation and durable queue are unchanged."""
+    def safe(text):
+        text = " ".join(str(text).split())
+        text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        return text.translate(str.maketrans({"*": "＊", "_": "＿", "~": "～", "`": "ˋ"}))
 
-    Keep changed metrics separate from current status: one metric recovering
-    does not mean the sensor has fully recovered. Plain-text identity/context
-    prevents names and device IDs from becoming mentions or custom emoji.
-    """
-    def plain(text):
-        return {"type": "plain_text", "text": text, "emoji": False}
+    def timestamp(value):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                return str(value)
+            return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        except (ValueError, TypeError, AttributeError):
+            return str(value)
 
-    def bold(text):
-        return {"type": "mrkdwn", "text": text, "verbatim": True}
-
-    metrics = (("temperature_c", "Temperature", "°C", "temp_min", "temp_max"),
+    metrics = (("temperature_c", "Temp", "°C", "temp_min", "temp_max"),
                ("humidity_rh", "RH", "%", "rh_min", "rh_max"))
-    statuses, changes, fields, readings = {}, [], [], []
+    statuses, readings = [], []
     recovered = False
     for key, label, unit, low_key, high_key in metrics:
-        value, low, high = data[key], settings[low_key], settings[high_key]
-        status = "low" if value < low else "high" if value > high else "normal"
-        statuses[key] = status
-        if any(event.startswith(key + ":") for event in events):
-            change = "Recovered" if status == "normal" else "Too " + status
-            changes.append(f"*{label}: {change}*")
-            recovered = recovered or status == "normal"
-        fields.append(bold(f"*{label}*\n*{value:.2f} {unit}* · {status.upper()}\n"
-                           f"Allowed: {low:g}–{high:g} {unit}"))
-        readings.append(f"{label}: {value:.2f} {unit} ({status}; allowed {low:g}–{high:g} {unit})")
-    normal = all(status == "normal" for status in statuses.values())
-    title = "✅ HVAC recovery" if normal else ("⚠️ HVAC status update" if recovered else "🚨 HVAC alert")
-    if recovered and not normal:
-        changes.append("Other readings remain outside the limits.")
-    context = [plain("Device: " + data["device_id"].replace(":", "-")),
-               plain("Last reading (UTC): " + observed_at)]
-    if reason != "reading" or observed_at != evaluated_at:
-        context.append(plain(f"Evaluated (UTC): {evaluated_at} | Reason: {reason}"))
-    # Fallback text is also meaningful in notifications and screen readers.
-    display_name = name.replace(":", "-") if name == data["device_id"] else name
-    fallback = (f"{title} — {display_name}\n" + "; ".join(change.replace("*", "") for change in changes) +
-                "\n" + "; ".join(readings) + "\n" +
-                "\n".join(item["text"] for item in context))
+        value = data[key]
+        status = "LOW" if value < settings[low_key] else "HIGH" if value > settings[high_key] else "NORMAL"
+        statuses.append(status)
+        changed = any(event.startswith(key + ":") for event in events)
+        metric_recovered = changed and status == "NORMAL"
+        recovered = recovered or metric_recovered
+        # Include transitions (including recovery) and any ongoing abnormality.
+        # A metric that has stayed normal adds no useful alert information.
+        if changed or status != "NORMAL":
+            icon = {"HIGH": "🔴", "LOW": "🔵", "NORMAL": "🟢"}[status]
+            readings.append(f"{label} {value:.2f}{unit} {icon} {status}")
+    normal = all(status == "NORMAL" for status in statuses)
+    title = "✅ HVAC" if normal else ("⚠️ HVAC" if recovered else "🚨 HVAC")
+    device = str(data["device_id"]).replace(":", "-")
+    display_name = device if name == data["device_id"] else name
+    fallback = " | ".join([title, *readings, display_name, device, timestamp(evaluated_at)])
+    # One section, no explicit line breaks; narrow clients may wrap naturally.
+    text = " | ".join([f"*{safe(title)}*",
+                       *[f"*{safe(reading)}*" for reading in readings],
+                       f"*{safe(display_name)}*", f"`{safe(device)}`",
+                       safe(timestamp(evaluated_at))])
     payload = {"text": fallback, "mrkdwn": False, "blocks": [
-        {"type": "header", "text": plain(title)},
-        {"type": "header", "text": plain(display_name[:150])},
-        {"type": "section", "text": bold("\n".join(changes))},
-        {"type": "section", "fields": fields},
-        {"type": "context", "elements": context},
+        {"type": "section", "text": {"type": "mrkdwn", "text": text, "verbatim": True}}
     ]}
     return json.dumps({"format": "hvac_alert_v1", "payload": payload}, ensure_ascii=False)
 
@@ -266,7 +307,7 @@ def update_settings(values, user_id, expected_version, request_id, notify=False)
     A duplicate view submission cannot produce a duplicate audit or notification.
     """
     if user_id not in SETTINGS_EDITORS:
-        raise PermissionError("Only the two configured project editors may change settings.")
+        raise PermissionError("Only authorized project editors may change settings.")
     errors = validate_settings(values)
     if errors:
         raise ValueError(" ".join(errors.values()))
@@ -495,7 +536,19 @@ def main():
     parser.add_argument("--end", help="Exclusive ISO time with timezone offset")
     parser.add_argument("--test-slack", action="store_true",
                         help="Send one clearly labeled test message, then exit")
+    permissions = parser.add_mutually_exclusive_group()
+    permissions.add_argument("--add-editor", metavar="SLACK_USER_ID")
+    permissions.add_argument("--remove-editor", metavar="SLACK_USER_ID")
+    permissions.add_argument("--list-editors", action="store_true")
     args = parser.parse_args()
+    if args.add_editor or args.remove_editor or args.list_editors:
+        if args.test_slack or args.set_name or args.recent is not None or any((args.device, args.name, args.start, args.end)):
+            parser.error("Use permission commands separately from other operations")
+        try:
+            manage_editors(args.add_editor, args.remove_editor)
+        except (ValueError, OSError) as exc:
+            parser.exit(1, str(exc) + "\n")
+        return
     if args.recent is not None and args.recent < 1:
         parser.error("--recent must be at least 1")
     try:
