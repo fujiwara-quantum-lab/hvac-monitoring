@@ -13,6 +13,10 @@ import math
 import sqlite3
 import statistics
 import threading
+from zoneinfo import ZoneInfo
+import recent_plot_settings
+
+EASTERN = ZoneInfo("America/New_York")
 
 PLOT_LOCK = threading.Lock()
 MAX_ROWS = 200000
@@ -236,13 +240,26 @@ def load_recent(db_path, now=None):
             "weather": load_weather(db_path, start, end), "invalid": invalid}
 
 
-def render_recent(snapshot, range_key, gap_seconds=180):
+def recent_axis_bounds(snapshot, overrides=None):
+    """One shared scale per quantity, based on the entire 30-day snapshot."""
+    limits = {}
+    for metric, suffix, span, fallback in ((1, 'temp', .2, (0, 30)), (2, 'rh', 1, (0, 100))):
+        inside = [p[metric] for sensor in snapshot['sensors'] for p in sensor['points'] if math.isfinite(p[metric])]
+        outside = [p[metric] for p in snapshot['weather']['points'] if math.isfinite(p[metric])]
+        for prefix, values in (('indoor', inside), ('outdoor', outside)):
+            key = prefix + '_' + suffix
+            limits[key] = (overrides or {}).get(key) or (axis_limits(values, span) if values else fallback)
+    return limits
+
+
+def render_recent(snapshot, range_key, gap_seconds=180, bounds=None):
     """One PNG: aligned temperature/RH panels, independent outdoor right axes."""
     if range_key not in RECENT_RANGES:
         raise ValueError("Unknown recent plot range")
     end = snapshot["end"]
     start = end - timedelta(seconds=RECENT_RANGES[range_key])
     sensors = snapshot["sensors"]
+    bounds = bounds or recent_axis_bounds(snapshot)
     outdoor = [p for p in snapshot["weather"]["points"] if start <= p[0] < end]
     with PLOT_LOCK:
         from matplotlib.figure import Figure
@@ -265,14 +282,11 @@ def render_recent(snapshot, range_key, gap_seconds=180):
             colors[device] = palette[index]
         def color(device):
             return colors[device]
-        legend_rows = math.ceil((len(sensors)+1)/3)
-        legend_height = .65*legend_rows + .25
-        height = 6.8 + legend_height
-        fig = Figure(figsize=(12, height), dpi=180, facecolor="white")
+        height = max(7, 1.5 + .24*(len(sensors)+2))
+        fig = Figure(figsize=(14, height), dpi=180, facecolor="white")
         FigureCanvasAgg(fig)
         axes = fig.subplots(2, 1, sharex=True)
-        fig.subplots_adjust(left=.09, right=.90, top=.97,
-                            bottom=(legend_height+.65)/height, hspace=.12)
+        fig.subplots_adjust(left=.08, right=.71, top=.96, bottom=.12, hspace=0)
         handles = []
         for sensor in sensors:
             name = " ".join(str(sensor["name"]).replace("$", "").split())
@@ -299,10 +313,11 @@ def render_recent(snapshot, range_key, gap_seconds=180):
                        marker="o", markersize=3)
             inside = [p[metric] for s in sensors for p in s["points"] if start <= p[0] < end]
             outside = [p[metric] for p in outdoor if math.isfinite(p[metric])]
-            if inside: ax.set_ylim(*axis_limits(inside, span))
-            else: ax.text(.02, .92, "No indoor data", transform=ax.transAxes, va="top", fontsize=10)
-            if outside: right.set_ylim(*axis_limits(outside, span))
-            else: ax.text(.98, .92, "No outdoor data", transform=ax.transAxes, ha="right", va="top", fontsize=10)
+            suffix = "temp" if metric == 1 else "rh"
+            ax.set_ylim(*bounds["indoor_" + suffix])
+            right.set_ylim(*bounds["outdoor_" + suffix])
+            if not inside: ax.text(.02, .92, "No indoor data", transform=ax.transAxes, va="top", fontsize=10)
+            if not outside: ax.text(.98, .92, "No outdoor data", transform=ax.transAxes, ha="right", va="top", fontsize=10)
             ax.set_ylabel(f"Indoor {label} ({unit})", fontsize=11)
             right.set_ylabel(f"Outdoor {label} ({unit})", fontsize=11)
             ax.set_xlim(start, end)
@@ -312,12 +327,15 @@ def render_recent(snapshot, range_key, gap_seconds=180):
                 formatter = ScalarFormatter(useOffset=False)
                 formatter.set_scientific(False)
                 axis.yaxis.set_major_formatter(formatter)
-                axis.spines['top'].set_visible(False)
-        axes[-1].xaxis.set_major_locator(AutoDateLocator(minticks=4, maxticks=7, tz=timezone.utc))
-        axes[-1].xaxis.set_major_formatter(DateFormatter("%m-%d\n%H:%M", tz=timezone.utc))
-        axes[-1].set_xlabel("Time (UTC)")
-        fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(.5,.01),
-                   ncol=3, prop={"size": 14, "weight": "bold"}, frameon=False,
+                axis.spines['top'].set_visible(True)
+                for spine in axis.spines.values():
+                    spine.set_linewidth(.9)
+                axis.yaxis.set_major_locator(MaxNLocator(nbins=5, prune='both'))
+        axes[-1].xaxis.set_major_locator(AutoDateLocator(minticks=4, maxticks=7, tz=EASTERN))
+        axes[-1].xaxis.set_major_formatter(DateFormatter("%m-%d\n%H:%M %Z", tz=EASTERN))
+        axes[-1].set_xlabel("Eastern Time (EST / EDT)")
+        fig.legend(handles=handles, loc="center left", bbox_to_anchor=(.80,.54),
+                   ncol=1, prop={"size": 10}, frameon=False,
                    handlelength=2, columnspacing=1.2, labelspacing=.7)
         buffer = BytesIO()
         fig.savefig(buffer, format="png", dpi=180, facecolor="white")
@@ -328,12 +346,13 @@ def render_recent(snapshot, range_key, gap_seconds=180):
 def export_recent(db_path, output_dir, now=None):
     """Build all four images from one snapshot; return paths and data cutoff."""
     snapshot = load_recent(db_path, now)
+    bounds = recent_axis_bounds(snapshot, recent_plot_settings.read(db_path)["bounds"])
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     paths = {}
     for key in RECENT_RANGES:
         path = destination / f"recent_{key}.png"
-        path.write_bytes(render_recent(snapshot, key))
+        path.write_bytes(render_recent(snapshot, key, bounds=bounds))
         paths[key] = str(path)
     return {"paths": paths, "data_cutoff_utc": snapshot["end"].isoformat(),
             "weather_note": snapshot["weather"]["note"], "invalid_rows": snapshot["invalid"]}

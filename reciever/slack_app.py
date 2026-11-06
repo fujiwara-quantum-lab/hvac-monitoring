@@ -27,6 +27,7 @@ import threading
 from collections import OrderedDict
 from io import BytesIO
 import hvac_plot
+import recent_plot_settings
 from contextlib import closing
 from pathlib import Path
 
@@ -396,6 +397,8 @@ def connection_panel(user_id=None, device_id=None, range_key="1h", client=None,
     if user_id in receiver.SETTINGS_EDITORS:
         buttons.append({"type": "button", "action_id": "hvac_settings_open",
                         "text": plain("Set alert limits"), "value": "settings"})
+        buttons.append({"type": "button", "action_id": "hvac_recent_axes_open",
+                        "text": plain("Recent Plots Y axes"), "value": "axes"})
     blocks = sensor_overview(settings, overview, now)
     blocks.extend([{"type": "divider"}, {"type": "header", "text": plain("Selected sensor")}])
     if count:
@@ -1004,6 +1007,70 @@ def save_settings(ack, body, view):
         "close": plain("Done"), "blocks": [{"type": "section", "text": plain(text)}]})
 
 
+def open_recent_axes(ack, body, client, respond):
+    ack()
+    if body.get('user', {}).get('id') not in receiver.SETTINGS_EDITORS:
+        respond(response_type='ephemeral', text='You do not have permission to change plot ranges.')
+        return
+    try:
+        settings = recent_plot_settings.read(receiver.DB_PATH)
+        blocks = [{'type': 'section', 'text': plain(
+            'All four Recent Plots share these Y-axis ranges. Leave BOTH fields of an axis blank '
+            'for automatic scaling using the last 30 days. Manual ranges can clip data.')}]
+        for axis, label in recent_plot_settings.AXES.items():
+            for i, side in enumerate(('min', 'max')):
+                # Explicit invisible placeholder suppresses Slack's default prompt.
+                element = {'type': 'plain_text_input', 'action_id': 'value',
+                           'placeholder': plain('\u200b')}
+                if axis in settings['bounds']:
+                    element['initial_value'] = f"{settings['bounds'][axis][i]:g}"
+                blocks.append({'type': 'input', 'optional': True, 'block_id': axis+'_'+side,
+                               'label': plain(label+' — '+side), 'element': element})
+        client.views_open(trigger_id=body['trigger_id'], view={
+            'type': 'modal', 'callback_id': 'hvac_recent_axes_save',
+            'title': plain('Recent Plots Y axes'), 'submit': plain('Save'), 'close': plain('Cancel'),
+            'private_metadata': json.dumps({'version': settings['version']}), 'blocks': blocks})
+    except Exception as exc:
+        print(f'Unable to open plot settings ({type(exc).__name__}).', flush=True)
+        respond(response_type='ephemeral', text='Unable to open plot settings. Retry shortly.')
+
+
+def save_recent_axes(ack, body, view):
+    first = 'indoor_temp_min'
+    user = body.get('user', {}).get('id')
+    if user not in receiver.SETTINGS_EDITORS:
+        ack(response_action='errors', errors={first: 'You do not have permission to change plot ranges.'})
+        return
+    bounds, errors = {}, {}
+    fields = view['state']['values']
+    for axis in recent_plot_settings.AXES:
+        keys = [axis+'_min', axis+'_max']
+        raw = [(fields.get(key, {}).get('value', {}).get('value') or '').strip() for key in keys]
+        if not any(raw):
+            continue
+        try:
+            pair = [float(v) for v in raw]
+            recent_plot_settings.validate({axis: pair})
+            bounds[axis] = pair
+        except (ValueError, TypeError, OverflowError):
+            errors[keys[0]] = 'Enter both finite bounds with minimum < maximum, or leave both blank.'
+    if errors:
+        ack(response_action='errors', errors=errors)
+        return
+    try:
+        recent_plot_settings.save(receiver.DB_PATH, bounds,
+            json.loads(view['private_metadata'])['version'], user, receiver.SETTINGS_EDITORS)
+    except (ValueError, PermissionError, KeyError, TypeError) as exc:
+        ack(response_action='errors', errors={first: str(exc)[:200]})
+        return
+    except sqlite3.Error:
+        ack(response_action='errors', errors={first: 'Database unavailable. Retry shortly.'})
+        return
+    ack(response_action='update', view={'type': 'modal', 'title': plain('Recent Plots Y axes'),
+        'close': plain('Done'), 'blocks': [{'type': 'section', 'text': plain(
+            'Saved. All four plots will use these ranges at the next scheduled Canvas refresh.')} ]})
+
+
 def read_token(name, prefix):
     token = os.environ.get(name, "").strip()
     if not token.startswith(prefix) or len(token) <= len(prefix):
@@ -1052,6 +1119,8 @@ def main():
         app.action(re.compile(r"^hvac_file_link_[0-9]+$"))(lambda ack: ack())
         app.action("hvac_settings_open")(open_settings)
         app.view("hvac_settings_save")(save_settings)
+        app.action("hvac_recent_axes_open")(open_recent_axes)
+        app.view("hvac_recent_axes_save")(save_recent_axes)
 
         @app.error
         def on_error(error):

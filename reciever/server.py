@@ -18,6 +18,7 @@ import urllib.error
 from urllib.parse import urlsplit
 import sqlite3
 from contextlib import closing
+from zoneinfo import ZoneInfo
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -232,7 +233,7 @@ def alert_message(name, data, observed_at, evaluated_at, settings, reason, event
             dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
             if dt.tzinfo is None:
                 return str(value)
-            return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            return dt.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S %Z")
         except (ValueError, TypeError, AttributeError):
             return str(value)
 

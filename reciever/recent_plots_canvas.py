@@ -27,7 +27,8 @@ def save(state):
 
 
 def document(links, cutoff, updated, previous_success=None):
-    lines = [f'**Last updated (UTC): {updated:%Y-%m-%d %H:%M:%S}**',
+    updated = updated.astimezone(hvac_plot.EASTERN)
+    lines = [f'**Last updated: {updated:%Y-%m-%d %H:%M:%S %Z}**',
              'Refresh interval: 5 minutes']
     for key, label in LABELS.items():
         lines.extend([f'## {label}', f'![{label}]({links[key]})'])
